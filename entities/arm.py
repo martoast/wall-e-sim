@@ -160,21 +160,42 @@ class Arm:
         """
         Attempt to pick up a piece of trash.
 
-        Args:
-            trash: The trash to pick up
-
-        Returns:
-            True if successful
+        IMPROVED: Multiple pickup zones for maximum reliability:
+        1. Near the claw tip
+        2. Near the elbow joint
+        3. Along the arm segment
+        4. Near the robot front (for trash that slipped under)
         """
         if self.holding is not None:
             return False
 
-        claw_pos = self.get_claw_position()
-        trash_dist = distance(claw_pos, trash.position)
+        if trash.is_picked:
+            return False
 
-        # Check if trash is within claw reach (generous tolerance)
-        pickup_range = CLAW_SIZE + trash.size + 15  # Extra tolerance
-        if trash_dist <= pickup_range:
+        claw_pos = self.get_claw_position()
+        joint_pos = self.get_joint_position()
+        mount_pos = self.get_mount_position()
+
+        # Check distance from multiple points to catch all scenarios
+        claw_dist = distance(claw_pos, trash.position)
+        joint_dist = distance(joint_pos, trash.position)
+        mount_dist = distance(mount_pos, trash.position)
+
+        # Also check the midpoint of segment 2 (between joint and claw)
+        mid_seg2 = (
+            (joint_pos[0] + claw_pos[0]) / 2,
+            (joint_pos[1] + claw_pos[1]) / 2
+        )
+        mid_dist = distance(mid_seg2, trash.position)
+
+        # Find the minimum distance from any arm part
+        min_dist = min(claw_dist, joint_dist, mid_dist, mount_dist)
+
+        # VERY generous pickup range - prioritize success over precision
+        # This ensures the robot can actually grab trash reliably
+        pickup_range = CLAW_SIZE + trash.size + 40  # Increased from 30
+
+        if min_dist <= pickup_range:
             if trash.pick_up(self.robot):
                 self.holding = trash
                 self.claw_open = False
@@ -185,18 +206,22 @@ class Arm:
 
     def update(self, dt: float = 1.0):
         """Update arm state."""
-        # Update extension (faster rate for snappy response)
-        extend_rate = 0.08  # Extension per frame
-        retract_rate = 0.12  # Retraction per frame
+        # Cap dt so arm doesn't extend too fast at high simulation speeds
+        # This ensures reliable pickup behavior at any speed multiplier
+        arm_dt = min(dt, 1.5)
+
+        # Arm extension/retraction rates
+        extend_rate = 0.12
+        retract_rate = 0.15
 
         if self.extension < self.target_extension:
             self.extension = min(
-                self.extension + extend_rate * dt,
+                self.extension + extend_rate * arm_dt,
                 self.target_extension
             )
         elif self.extension > self.target_extension:
             self.extension = max(
-                self.extension - retract_rate * dt,
+                self.extension - retract_rate * arm_dt,
                 self.target_extension
             )
 

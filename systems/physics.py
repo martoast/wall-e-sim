@@ -27,7 +27,7 @@ class PhysicsSystem:
 
     Collision Types:
     - Robot vs Obstacle: Stop robot, slide along surface
-    - Robot vs Trash: Push trash, robot continues if trash can move
+    - Robot vs Trash: Allow approach if targeting that trash, otherwise stop
     - Robot vs Robot: Both stop, push apart
     - Trash vs Obstacle: Trash stops
     - Trash vs Trash: Both stop
@@ -36,6 +36,15 @@ class PhysicsSystem:
 
     def __init__(self):
         self.debug_collisions: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        # Track which trash each robot is targeting (robot_id -> trash_id)
+        self.robot_targets: dict = {}
+
+    def set_robot_target(self, robot_id: int, trash_id: int = None):
+        """Set or clear the trash target for a robot."""
+        if trash_id is None:
+            self.robot_targets.pop(robot_id, None)
+        else:
+            self.robot_targets[robot_id] = trash_id
 
     def update(
         self,
@@ -129,14 +138,21 @@ class PhysicsSystem:
                 )
                 blocked = True
 
-        # Check trash collisions - just stop (don't push trash)
+        # Check trash collisions - allow approach to target trash
+        target_trash_id = self.robot_targets.get(robot.id, None)
         for trash in trash_group:
             if trash.is_picked:
                 continue
 
+            # CRITICAL FIX: Allow robot to approach its target trash!
+            # This is the trash the robot is trying to pick up
+            if target_trash_id is not None and trash.id == target_trash_id:
+                # Robot is targeting this trash - allow approach for pickup
+                continue
+
             trash_rect = trash.get_rect()
             if test_rect.colliderect(trash_rect):
-                # Stop at the trash - stuck detection will handle re-pathing
+                # Stop at non-target trash - stuck detection will handle re-pathing
                 new_x, new_y = self._resolve_aabb_collision(
                     robot.x, robot.y, robot.width, robot.height,
                     trash_rect, vx * dt, vy * dt

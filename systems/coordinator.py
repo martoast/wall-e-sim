@@ -30,6 +30,10 @@ class Coordinator:
         # First in list = currently dumping or next to dump
         self.dump_queue: List[int] = []
 
+        # Ramp occupancy: which robot (if any) is currently on the ramp
+        # None = ramp is clear, robot_id = that robot is on the ramp
+        self.robot_on_ramp: Optional[int] = None
+
     def claim_trash(self, robot_id: int, trash: 'Trash') -> bool:
         """
         Attempt to claim trash for a robot.
@@ -243,5 +247,41 @@ class Coordinator:
         """Get number of robots waiting to dump."""
         return len(self.dump_queue)
 
+    # ========== Ramp Occupancy Management ==========
+
+    def claim_ramp(self, robot_id: int) -> bool:
+        """
+        Robot claims the ramp for exclusive access.
+
+        Args:
+            robot_id: The robot claiming the ramp
+
+        Returns:
+            True if claim successful (ramp was clear or already owned),
+            False if another robot is on the ramp
+        """
+        if self.robot_on_ramp is None:
+            self.robot_on_ramp = robot_id
+            return True
+        return self.robot_on_ramp == robot_id
+
+    def release_ramp(self, robot_id: int):
+        """
+        Robot releases the ramp after fully clearing it.
+
+        Args:
+            robot_id: The robot releasing the ramp
+        """
+        if self.robot_on_ramp == robot_id:
+            self.robot_on_ramp = None
+
+    def is_ramp_clear(self) -> bool:
+        """Check if the ramp is clear for use."""
+        return self.robot_on_ramp is None
+
+    def get_ramp_owner(self) -> Optional[int]:
+        """Get the robot ID currently on the ramp, or None."""
+        return self.robot_on_ramp
+
     def __repr__(self) -> str:
-        return f"Coordinator(claims={len(self.trash_claims)}, zones={len(self.patrol_zones)}, queue={len(self.dump_queue)})"
+        return f"Coordinator(claims={len(self.trash_claims)}, zones={len(self.patrol_zones)}, queue={len(self.dump_queue)}, ramp={self.robot_on_ramp})"

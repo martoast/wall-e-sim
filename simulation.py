@@ -22,6 +22,7 @@ from systems.behavior import BehaviorController
 from systems.telemetry import Telemetry, EventType
 from systems.physics import PhysicsSystem
 from systems.coordinator import Coordinator
+from systems.shared_map import SharedMap
 
 
 class Simulation:
@@ -29,10 +30,15 @@ class Simulation:
     Main simulation class that runs the WALL-E garbage collection simulation.
 
     Controls:
-    - F1: Toggle debug overlay
+    - Left Click: Spawn trash at mouse position
+    - Right Click: Spawn obstacle at mouse position
+    - D: Toggle debug overlay
     - SPACE: Pause/Resume
     - R: Reset simulation
-    - T: Spawn trash at mouse position
+    - +/=: Add a robot
+    - -: Remove a robot
+    - Up Arrow: Speed up simulation
+    - Down Arrow: Slow down simulation
     - ESC: Quit
     """
 
@@ -48,11 +54,20 @@ class Simulation:
         self.running = True
         self.paused = False
         self.debug_mode = False
+        self.game_won = False
+        self.win_screen_alpha = 0  # For fade-in effect
+        self.restart_button_rect = None  # Set when win screen is drawn
+
+        # Simulation speed control
+        self.speed_multiplier = 1.0
+        self.MIN_SPEED = 0.25
+        self.MAX_SPEED = 4.0
 
         # Initialize systems
         self.telemetry = Telemetry()
         self.physics = PhysicsSystem()
         self.coordinator = Coordinator()
+        self.shared_map = SharedMap(SCREEN_WIDTH, SCREEN_HEIGHT)
 
         # Create sprite groups
         self.trash_group = pygame.sprite.Group()
@@ -189,8 +204,15 @@ class Simulation:
                         too_close = True
                         break
 
+                # Avoid spawning on robots
                 if not too_close:
-                    trash = Trash((x, y))
+                    for robot in self.robots:
+                        if abs(x - robot.x) < 60 and abs(y - robot.y) < 60:
+                            too_close = True
+                            break
+
+                if not too_close:
+                    trash = Trash((x, y), trash_type='general')
                     self.trash_group.add(trash)
                     break
 
@@ -198,8 +220,56 @@ class Simulation:
 
     def _spawn_trash_at(self, position: tuple):
         """Spawn a single trash item at a specific position."""
-        trash = Trash(position)
+        trash = Trash(position, trash_type='general')
         self.trash_group.add(trash)
+
+    def _add_robot(self):
+        """Add a new robot to the simulation."""
+        robot_id = len(self.robots)
+        x, y = self._find_valid_robot_spawn()
+
+        robot = Robot((x, y), robot_id=robot_id)
+        arm = Arm(robot)
+
+        sensors = SensorSystem()
+        navigation = Navigation()
+        behavior = BehaviorController(robot, self.nest, sensors, navigation)
+
+        self.robots.append(robot)
+        self.behavior_controllers.append(behavior)
+
+        # Update telemetry and patrol zones
+        self.telemetry.update_distance(robot_id, (x, y))
+        self.coordinator.assign_patrol_zones(len(self.robots), SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # Regenerate patrol paths for all robots with new zones
+        for bc in self.behavior_controllers:
+            bc._coordinator = self.coordinator
+            bc._generate_patrol()
+
+    def _remove_robot(self):
+        """Remove the last robot from the simulation."""
+        if len(self.robots) <= 1:
+            return  # Keep at least one robot
+
+        # Remove last robot
+        robot = self.robots.pop()
+        behavior = self.behavior_controllers.pop()
+
+        # Release any trash claims
+        if behavior.target_trash and self.coordinator:
+            self.coordinator.release_claim(behavior.target_trash.id)
+
+        # Leave dump queue if in it
+        self.coordinator.leave_queue(robot.id)
+
+        # Reassign patrol zones
+        self.coordinator.assign_patrol_zones(len(self.robots), SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # Regenerate patrol paths for remaining robots
+        for bc in self.behavior_controllers:
+            bc._coordinator = self.coordinator
+            bc._generate_patrol()
 
     def handle_events(self):
         """Handle pygame events."""
@@ -211,9 +281,8 @@ class Simulation:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
 
-                elif event.key == pygame.K_F1:
+                elif event.key == pygame.K_d:
                     self.debug_mode = not self.debug_mode
-                    self.telemetry.toggle_overlay()
 
                 elif event.key == pygame.K_SPACE:
                     self.paused = not self.paused
@@ -225,6 +294,48 @@ class Simulation:
                     # Spawn trash at mouse position
                     mouse_pos = pygame.mouse.get_pos()
                     self._spawn_trash_at(mouse_pos)
+
+                elif event.key in (pygame.K_PLUS, pygame.K_EQUALS):
+                    # Add a robot
+                    self._add_robot()
+
+                elif event.key == pygame.K_MINUS:
+                    # Remove a robot
+                    self._remove_robot()
+
+                elif event.key == pygame.K_UP:
+                    # Increase simulation speed
+                    self.speed_multiplier = min(self.MAX_SPEED, self.speed_multiplier * 1.5)
+
+                elif event.key == pygame.K_DOWN:
+                    # Decrease simulation speed
+                    self.speed_multiplier = max(self.MIN_SPEED, self.speed_multiplier / 1.5)
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mouse_pos = pygame.mouse.get_pos()
+                if event.button == 1:  # Left click
+                    # Check if clicking restart button on win screen
+                    if self.game_won and self.restart_button_rect and self.restart_button_rect.collidepoint(mouse_pos):
+                        self.reset()
+                    elif not self.game_won:
+                        self._spawn_trash_at(mouse_pos)
+                elif event.button == 3:  # Right click
+                    if not self.game_won:
+                        self._spawn_obstacle_at(mouse_pos)
+
+    def _spawn_obstacle_at(self, position: tuple):
+        """Spawn an obstacle at a specific position."""
+        # Check if too close to robots
+        for robot in self.robots:
+            if abs(position[0] - robot.x) < 60 and abs(position[1] - robot.y) < 60:
+                return  # Don't spawn on robots
+
+        # Check if too close to nest
+        if abs(position[0] - self.nest.x) < 100 and abs(position[1] - self.nest.y) < 100:
+            return  # Don't spawn on nest
+
+        obstacle = Obstacle(position)
+        self.obstacle_group.add(obstacle)
 
     def update(self, dt: float):
         """Update simulation state."""
@@ -242,7 +353,7 @@ class Simulation:
         # Update behavior controllers (sets velocities)
         for i, behavior in enumerate(self.behavior_controllers):
             old_state = behavior.current_state
-            behavior.update(dt, self.trash_group, self.obstacle_group, self.robots, self.coordinator, self.telemetry)
+            behavior.update(dt, self.trash_group, self.obstacle_group, self.robots, self.coordinator, self.telemetry, self.shared_map)
 
             # Log state changes
             if behavior.current_state != old_state:
@@ -251,6 +362,13 @@ class Simulation:
                     self.robots[i].id,
                     {'from': old_state.value, 'to': behavior.current_state.value}
                 )
+
+            # CRITICAL: Tell physics which trash this robot is targeting
+            # This allows the robot to approach its target trash for pickup
+            if behavior.target_trash and not behavior.target_trash.is_picked:
+                self.physics.set_robot_target(self.robots[i].id, behavior.target_trash.id)
+            else:
+                self.physics.set_robot_target(self.robots[i].id, None)
 
         # Apply physics (collision detection and response)
         self.physics.update(
@@ -269,11 +387,80 @@ class Simulation:
         for trash in self.trash_group:
             trash.update()
 
-        # Spawn new trash periodically
-        self.trash_spawn_timer += dt
-        if self.trash_spawn_timer >= TRASH_SPAWN_INTERVAL * FPS:
-            self._spawn_trash(1)
-            self.trash_spawn_timer = 0
+        # Check win condition - all trash collected and dumped
+        self._check_win_condition()
+
+    def _check_win_condition(self):
+        """Check if all trash has been collected and dumped."""
+        if self.game_won:
+            return
+
+        # Check if there's any trash left on the ground
+        if len(self.trash_group) > 0:
+            return
+
+        # Check if any robot is still holding trash or has trash in bin
+        for robot in self.robots:
+            if robot.bin_count > 0:
+                return
+            if robot.arm and robot.arm.holding:
+                return
+
+        # All trash collected and dumped!
+        self.game_won = True
+
+    def _draw_win_screen(self):
+        """Draw the victory screen overlay."""
+        # Fade in effect
+        if self.win_screen_alpha < 200:
+            self.win_screen_alpha += 5
+
+        # Semi-transparent overlay
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, self.win_screen_alpha))
+        self.screen.blit(overlay, (0, 0))
+
+        # Only show text once faded in enough
+        if self.win_screen_alpha < 100:
+            return
+
+        # Victory text
+        title_font = pygame.font.Font(None, 80)
+        subtitle_font = pygame.font.Font(None, 36)
+
+        # Main title with green color
+        title = title_font.render("ALL TRASH COLLECTED!", True, (100, 255, 100))
+        title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 60))
+        self.screen.blit(title, title_rect)
+
+        # Stats
+        total_dumped = self.nest.fill_level
+        stats_text = subtitle_font.render(f"Total items recycled: {total_dumped}", True, (200, 200, 200))
+        stats_rect = stats_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+        self.screen.blit(stats_text, stats_rect)
+
+        # Restart button
+        button_width, button_height = 200, 50
+        button_x = SCREEN_WIDTH // 2 - button_width // 2
+        button_y = SCREEN_HEIGHT // 2 + 60
+
+        # Store button rect for click detection
+        self.restart_button_rect = pygame.Rect(button_x, button_y, button_width, button_height)
+
+        # Button background
+        mouse_pos = pygame.mouse.get_pos()
+        if self.restart_button_rect.collidepoint(mouse_pos):
+            button_color = (80, 180, 80)  # Hover color
+        else:
+            button_color = (60, 140, 60)
+
+        pygame.draw.rect(self.screen, button_color, self.restart_button_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (100, 255, 100), self.restart_button_rect, 3, border_radius=10)
+
+        # Button text
+        button_text = subtitle_font.render("RESTART", True, (255, 255, 255))
+        button_text_rect = button_text.get_rect(center=self.restart_button_rect.center)
+        self.screen.blit(button_text, button_text_rect)
 
     def draw(self):
         """Draw everything."""
@@ -297,8 +484,10 @@ class Simulation:
             if robot.arm:
                 robot.arm.draw(self.screen)
 
-        # Draw debug overlays
+        # Draw ALL debug overlays - controlled by single debug_mode flag
         if self.debug_mode:
+            # Draw shared map heatmap (risky areas)
+            self.shared_map.draw_debug(self.screen)
             self.nest.draw_debug(self.screen, self.font)
 
             for i, robot in enumerate(self.robots):
@@ -311,14 +500,14 @@ class Simulation:
             # Draw physics debug (collision boxes, velocities)
             self.physics.draw_debug(self.screen, self.robots, self.trash_group)
 
-        # Draw telemetry overlay
-        fps = self.clock.get_fps()
-        self.telemetry.draw_overlay(
-            self.screen,
-            self.robots,
-            self.nest,
-            fps
-        )
+            # Draw telemetry stats overlay
+            fps = self.clock.get_fps()
+            self.telemetry.draw_overlay(
+                self.screen,
+                self.robots,
+                self.nest,
+                fps
+            )
 
         # Draw pause indicator
         if self.paused:
@@ -331,14 +520,30 @@ class Simulation:
             self.screen.blit(pause_text, rect)
 
         # Draw controls hint
-        if not self.debug_mode:
-            hint = self.font.render("F1: Debug | SPACE: Pause | T: Spawn Trash | R: Reset", True, (150, 150, 150))
+        if not self.debug_mode and not self.game_won:
+            hint = self.font.render("LClick: Trash | RClick: Rock | D: Debug | SPACE: Pause | +/-: Robots | Up/Down: Speed | R: Reset", True, (150, 150, 150))
             self.screen.blit(hint, (10, SCREEN_HEIGHT - 25))
+
+        # Draw speed indicator
+        if not self.game_won:
+            speed_text = f"Speed: {self.speed_multiplier:.2f}x"
+            speed_color = (150, 150, 150) if self.speed_multiplier == 1.0 else (100, 200, 255)
+            speed_label = self.font.render(speed_text, True, speed_color)
+            self.screen.blit(speed_label, (SCREEN_WIDTH - 100, 10))
+
+        # Draw win screen if game is won
+        if self.game_won:
+            self._draw_win_screen()
 
         pygame.display.flip()
 
     def reset(self):
         """Reset the simulation."""
+        # Reset game state
+        self.game_won = False
+        self.win_screen_alpha = 0
+        self.restart_button_rect = None
+
         # Clear groups
         self.trash_group.empty()
         self.obstacle_group.empty()
@@ -366,12 +571,13 @@ class Simulation:
         self.physics = PhysicsSystem()
         self.coordinator = Coordinator()
         self.coordinator.assign_patrol_zones(robot_count, SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.shared_map = SharedMap(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.trash_spawn_timer = 0
 
     def run(self):
         """Main simulation loop."""
         while self.running:
-            dt = 1.0  # Fixed timestep for simplicity
+            dt = self.speed_multiplier  # Adjustable timestep
 
             self.handle_events()
             self.update(dt)

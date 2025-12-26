@@ -67,8 +67,7 @@ class Telemetry:
         # For distance tracking
         self.last_positions: Dict[int, tuple] = {}
 
-        # Debug overlay settings
-        self.show_overlay = False
+        # Font for rendering (debug_mode is controlled by Simulation, not here)
         self.font: Optional[pygame.font.Font] = None
 
     def init_font(self):
@@ -160,10 +159,6 @@ class Telemetry:
         """Get the most recent events."""
         return self.events[-count:]
 
-    def toggle_overlay(self):
-        """Toggle debug overlay visibility."""
-        self.show_overlay = not self.show_overlay
-
     def draw_overlay(
         self,
         screen: pygame.Surface,
@@ -171,10 +166,7 @@ class Telemetry:
         nest: 'Nest',
         fps: float
     ):
-        """Draw debug overlay on screen."""
-        if not self.show_overlay:
-            return
-
+        """Draw debug overlay on screen. Only call when debug_mode is True."""
         self.init_font()
 
         # Background panel
@@ -222,10 +214,7 @@ class Telemetry:
         robot: 'Robot',
         behavior_controller=None
     ):
-        """Draw debug info for a specific robot."""
-        if not self.show_overlay:
-            return
-
+        """Draw debug info for a specific robot. Only call when debug_mode is True."""
         self.init_font()
 
         # Robot state label is drawn by robot itself

@@ -34,7 +34,7 @@ class Navigation:
     def __init__(
         self,
         bounds: Tuple[int, int, int, int] = None,
-        margin: int = 80
+        margin: int = 40  # Reduced from 80 to cover more area
     ):
         """
         Args:
@@ -47,7 +47,7 @@ class Navigation:
         self.bounds = bounds
         self.margin = margin
 
-        # Define safe navigation area
+        # Define safe navigation area (now closer to edges)
         self.nav_bounds = (
             bounds[0] + margin,
             bounds[1] + margin,
@@ -105,21 +105,25 @@ class Navigation:
         self,
         point_count: int = 6,
         nest_position: Tuple[float, float] = None,
-        zone_bounds: Tuple[int, int, int, int] = None
+        zone_bounds: Tuple[int, int, int, int] = None,
+        shared_map=None,
+        start_position: Tuple[float, float] = None
     ) -> List[Tuple[float, float]]:
         """
-        Generate a random patrol path that avoids the nest area.
+        Generate a random patrol path that covers the whole area including edges.
 
         Args:
             point_count: Number of waypoints
             nest_position: Position of nest to avoid
             zone_bounds: Optional (x, y, width, height) to constrain patrol area
+            shared_map: Shared map for avoiding learned risky areas
+            start_position: Robot's current position (for path checking)
 
         Returns:
             List of waypoint positions
         """
         waypoints = []
-        nest_avoid_radius = 200  # Stay this far from nest during patrol
+        nest_avoid_radius = 180  # Reduced from 200
 
         # Use zone bounds if provided, otherwise use full nav bounds
         if zone_bounds:
@@ -127,8 +131,49 @@ class Navigation:
         else:
             bounds = self.nav_bounds
 
+        # First, add 1-2 edge waypoints to ensure edge coverage
+        edge_margin = 50  # How close to actual screen edge
+        edge_waypoints_added = 0
+        max_edge_waypoints = random.randint(1, 2)
+
+        edge_positions = [
+            # Top edge
+            (random.uniform(edge_margin, SCREEN_WIDTH - edge_margin), edge_margin),
+            # Bottom edge
+            (random.uniform(edge_margin, SCREEN_WIDTH - edge_margin), SCREEN_HEIGHT - edge_margin),
+            # Left edge
+            (edge_margin, random.uniform(edge_margin, SCREEN_HEIGHT - edge_margin)),
+            # Right edge (but not too close to nest which is usually on right)
+            (SCREEN_WIDTH - edge_margin, random.uniform(edge_margin, SCREEN_HEIGHT - edge_margin)),
+            # Corners
+            (edge_margin, edge_margin),  # Top-left
+            (SCREEN_WIDTH - edge_margin, edge_margin),  # Top-right
+            (edge_margin, SCREEN_HEIGHT - edge_margin),  # Bottom-left
+        ]
+        random.shuffle(edge_positions)
+
+        for edge_pos in edge_positions:
+            if edge_waypoints_added >= max_edge_waypoints:
+                break
+
+            x, y = edge_pos
+
+            # Check if too close to nest
+            if nest_position:
+                dist_to_nest = distance((x, y), nest_position)
+                if dist_to_nest < nest_avoid_radius:
+                    continue
+
+            # Check if risky
+            if shared_map and shared_map.is_risky(x, y):
+                continue
+
+            waypoints.append((x, y))
+            edge_waypoints_added += 1
+
+        # Fill remaining waypoints with random positions
         attempts = 0
-        while len(waypoints) < point_count and attempts < 100:
+        while len(waypoints) < point_count and attempts < 150:
             x = random.uniform(bounds[0], bounds[0] + bounds[2])
             y = random.uniform(bounds[1], bounds[1] + bounds[3])
 
@@ -139,16 +184,37 @@ class Navigation:
                     attempts += 1
                     continue
 
+            # Check if this area is risky (learned from past stuck events)
+            if shared_map and shared_map.is_risky(x, y):
+                attempts += 1
+                continue
+
             # Check if too close to other waypoints
             too_close = False
             for wp in waypoints:
-                if distance((x, y), wp) < 100:
+                if distance((x, y), wp) < 80:  # Reduced from 100
                     too_close = True
                     break
 
-            if not too_close:
-                waypoints.append((x, y))
+            if too_close:
+                attempts += 1
+                continue
 
+            # Check if PATH to this waypoint is clear (not just the waypoint itself)
+            if shared_map:
+                # Check path from previous waypoint (or start position for first waypoint)
+                if waypoints:
+                    prev_pos = waypoints[-1]
+                elif start_position:
+                    prev_pos = start_position
+                else:
+                    prev_pos = None
+
+                if prev_pos and not shared_map.is_path_clear(prev_pos, (x, y)):
+                    attempts += 1
+                    continue
+
+            waypoints.append((x, y))
             attempts += 1
 
         return waypoints
