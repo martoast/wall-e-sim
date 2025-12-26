@@ -1,0 +1,3532 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+<additional_info>
+
+</additional_info>
+
+</file_summary>
+
+<directory_structure>
+entities/
+  __init__.py
+  arm.py
+  nest.py
+  obstacle.py
+  robot.py
+  trash.py
+systems/
+  __init__.py
+  behavior.py
+  navigation.py
+  sensors.py
+  telemetry.py
+terrain/
+  __init__.py
+  ground.py
+utils/
+  __init__.py
+  math_helpers.py
+config.py
+main.py
+simulation_log.txt
+simulation.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="entities/__init__.py">
+from .robot import Robot
+from .arm import Arm
+from .trash import Trash
+from .nest import Nest
+from .obstacle import Obstacle
+</file>
+
+<file path="entities/arm.py">
+"""
+Arm entity - articulated robot arm with claw.
+"""
+import pygame
+import math
+from typing import Tuple, Optional, TYPE_CHECKING
+from enum import Enum
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import (
+    ARM_SEGMENT_1_LENGTH, ARM_SEGMENT_2_LENGTH,
+    ARM_EXTEND_SPEED, ARM_RETRACT_SPEED, CLAW_SIZE,
+    COLOR_ARM, COLOR_CLAW, COLOR_CLAW_OPEN
+)
+from utils.math_helpers import distance, angle_to, lerp, clamp
+
+if TYPE_CHECKING:
+    from .robot import Robot
+    from .trash import Trash
+
+
+class ArmState(Enum):
+    """States the arm can be in."""
+    IDLE = "idle"
+    EXTENDING = "extending"
+    GRABBING = "grabbing"
+    RETRACTING = "retracting"
+    HOLDING = "holding"
+
+
+class Arm:
+    """
+    A 2-segment articulated arm with a claw.
+
+    Uses simple point-at-target logic rather than full inverse kinematics.
+    """
+
+    def __init__(self, robot: 'Robot'):
+        self.robot = robot
+        robot.arm = self  # Back-reference
+
+        # Segment lengths
+        self.segment1_length = ARM_SEGMENT_1_LENGTH
+        self.segment2_length = ARM_SEGMENT_2_LENGTH
+
+        # Joint angles (relative to previous segment)
+        self.joint1_angle = 0.0  # Base joint, relative to robot facing
+        self.joint2_angle = 0.0  # Elbow joint
+
+        # Extension state (0 = retracted, 1 = fully extended)
+        self.extension = 0.0
+        self.target_extension = 0.0
+
+        # Claw
+        self.claw_open = True
+        self.claw_angle = 30.0  # Angle of claw opening
+
+        # State
+        self.state = ArmState.IDLE
+        self.target_position: Optional[Tuple[float, float]] = None
+
+        # Held item
+        self.holding: Optional['Trash'] = None
+
+    @property
+    def total_length(self) -> float:
+        """Total arm reach."""
+        return self.segment1_length + self.segment2_length
+
+    def get_mount_position(self) -> Tuple[float, float]:
+        """Get where the arm is attached to the robot."""
+        return self.robot.get_arm_mount_position()
+
+    def get_joint_position(self) -> Tuple[float, float]:
+        """Get the position of the elbow joint."""
+        mount = self.get_mount_position()
+
+        # Joint1 angle is relative to robot facing
+        absolute_angle = self.robot.angle + self.joint1_angle
+
+        # Scale by extension
+        length = self.segment1_length * self.extension
+
+        rad = math.radians(absolute_angle)
+        return (
+            mount[0] + math.cos(rad) * length,
+            mount[1] + math.sin(rad) * length
+        )
+
+    def get_claw_position(self) -> Tuple[float, float]:
+        """Get the position of the claw end."""
+        joint = self.get_joint_position()
+
+        # Joint2 angle is relative to joint1
+        absolute_angle = self.robot.angle + self.joint1_angle + self.joint2_angle
+
+        # Scale by extension
+        length = self.segment2_length * self.extension
+
+        rad = math.radians(absolute_angle)
+        return (
+            joint[0] + math.cos(rad) * length,
+            joint[1] + math.sin(rad) * length
+        )
+
+    def reach_toward(self, target: Tuple[float, float]):
+        """
+        Set the arm to reach toward a target position.
+
+        Uses simple point-at-target logic.
+        """
+        self.target_position = target
+        self.state = ArmState.EXTENDING
+        self.target_extension = 1.0
+        self.claw_open = True
+
+        # Calculate angles to point at target
+        mount = self.get_mount_position()
+        target_angle = angle_to(mount, target)
+
+        # Joint1 points toward target (relative to robot)
+        self.joint1_angle = target_angle - self.robot.angle
+
+        # Joint2 continues in same direction
+        self.joint2_angle = 0
+
+    def grab(self) -> bool:
+        """
+        Close the claw to grab.
+
+        Returns:
+            True if currently holding something
+        """
+        self.claw_open = False
+        self.state = ArmState.GRABBING
+        return self.holding is not None
+
+    def release(self) -> Optional['Trash']:
+        """
+        Open the claw and release held item.
+
+        Returns:
+            The released trash item, if any
+        """
+        self.claw_open = True
+        released = self.holding
+        self.holding = None
+        return released
+
+    def retract(self):
+        """Retract the arm back to idle position."""
+        self.state = ArmState.RETRACTING
+        self.target_extension = 0.0
+        self.target_position = None
+
+    def pick_up_trash(self, trash: 'Trash') -> bool:
+        """
+        Attempt to pick up a piece of trash.
+
+        Args:
+            trash: The trash to pick up
+
+        Returns:
+            True if successful
+        """
+        if self.holding is not None:
+            return False
+
+        claw_pos = self.get_claw_position()
+        trash_dist = distance(claw_pos, trash.position)
+
+        # Check if trash is within claw reach (generous tolerance)
+        pickup_range = CLAW_SIZE + trash.size + 15  # Extra tolerance
+        if trash_dist <= pickup_range:
+            if trash.pick_up(self.robot):
+                self.holding = trash
+                self.claw_open = False
+                self.state = ArmState.HOLDING
+                return True
+
+        return False
+
+    def update(self, dt: float = 1.0):
+        """Update arm state."""
+        # Update extension (faster rate for snappy response)
+        extend_rate = 0.08  # Extension per frame
+        retract_rate = 0.12  # Retraction per frame
+
+        if self.extension < self.target_extension:
+            self.extension = min(
+                self.extension + extend_rate * dt,
+                self.target_extension
+            )
+        elif self.extension > self.target_extension:
+            self.extension = max(
+                self.extension - retract_rate * dt,
+                self.target_extension
+            )
+
+        # Check if done extending/retracting
+        if abs(self.extension - self.target_extension) < 0.01:
+            self.extension = self.target_extension
+            if self.state == ArmState.RETRACTING and self.extension == 0:
+                self.state = ArmState.IDLE
+                self.joint1_angle = 0
+                self.joint2_angle = 0
+
+        # Update held item position
+        if self.holding:
+            self.holding.position = self.get_claw_position()
+
+    def draw(self, screen: pygame.Surface):
+        """Draw the arm."""
+        if self.extension < 0.05:
+            return  # Arm is retracted, don't draw
+
+        mount = self.get_mount_position()
+        joint = self.get_joint_position()
+        claw = self.get_claw_position()
+
+        # Draw segment 1
+        pygame.draw.line(
+            screen, COLOR_ARM,
+            (int(mount[0]), int(mount[1])),
+            (int(joint[0]), int(joint[1])),
+            4
+        )
+
+        # Draw joint circle
+        pygame.draw.circle(
+            screen, COLOR_ARM,
+            (int(joint[0]), int(joint[1])),
+            5
+        )
+
+        # Draw segment 2
+        pygame.draw.line(
+            screen, COLOR_ARM,
+            (int(joint[0]), int(joint[1])),
+            (int(claw[0]), int(claw[1])),
+            3
+        )
+
+        # Draw claw
+        claw_color = COLOR_CLAW_OPEN if self.claw_open else COLOR_CLAW
+
+        # Claw is two arcs
+        claw_angle = self.robot.angle + self.joint1_angle + self.joint2_angle
+        claw_spread = self.claw_angle if self.claw_open else 5
+
+        # Left claw finger
+        left_angle = claw_angle - claw_spread
+        left_rad = math.radians(left_angle)
+        left_end = (
+            claw[0] + math.cos(left_rad) * CLAW_SIZE,
+            claw[1] + math.sin(left_rad) * CLAW_SIZE
+        )
+        pygame.draw.line(
+            screen, claw_color,
+            (int(claw[0]), int(claw[1])),
+            (int(left_end[0]), int(left_end[1])),
+            3
+        )
+
+        # Right claw finger
+        right_angle = claw_angle + claw_spread
+        right_rad = math.radians(right_angle)
+        right_end = (
+            claw[0] + math.cos(right_rad) * CLAW_SIZE,
+            claw[1] + math.sin(right_rad) * CLAW_SIZE
+        )
+        pygame.draw.line(
+            screen, claw_color,
+            (int(claw[0]), int(claw[1])),
+            (int(right_end[0]), int(right_end[1])),
+            3
+        )
+
+        # Draw held item if any (it draws itself at claw position)
+        if self.holding:
+            self.holding.draw(screen)
+
+    def __repr__(self) -> str:
+        return f"Arm(state={self.state.value}, ext={self.extension:.2f}, holding={self.holding is not None})"
+</file>
+
+<file path="entities/nest.py">
+"""
+Nest entity - central bin with ramp for trash disposal.
+"""
+import pygame
+import math
+from typing import Tuple
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import (
+    NEST_WIDTH, NEST_HEIGHT, NEST_POSITION, NEST_CAPACITY,
+    RAMP_WIDTH, RAMP_LENGTH, RAMP_ANGLE,
+    COLOR_NEST, COLOR_NEST_FILL, COLOR_RAMP
+)
+
+
+class Nest(pygame.sprite.Sprite):
+    """
+    Central collection bin with a ramp for robots to climb and dump trash.
+
+    The nest consists of:
+    - Main bin (tall rectangle)
+    - Ramp leading up to dumping position
+    - One-way flap (visual only)
+    """
+
+    def __init__(self, position: Tuple[float, float] = None):
+        super().__init__()
+
+        if position is None:
+            position = NEST_POSITION
+
+        self.x, self.y = position
+        self.width = NEST_WIDTH
+        self.height = NEST_HEIGHT
+
+        # Ramp properties
+        self.ramp_width = RAMP_WIDTH
+        self.ramp_length = RAMP_LENGTH
+        self.ramp_angle = RAMP_ANGLE  # degrees incline
+
+        # Capacity
+        self.capacity = NEST_CAPACITY
+        self.fill_level = 0
+
+        # Calculate key positions
+        self._calculate_positions()
+
+        # Create rect for collision
+        self.rect = pygame.Rect(
+            int(self.x - self.width // 2),
+            int(self.y - self.height // 2),
+            self.width,
+            self.height
+        )
+
+    def _calculate_positions(self):
+        """Calculate important positions for navigation."""
+        # Ramp starts to the left of the bin
+        self.ramp_start = (
+            self.x - self.width // 2 - self.ramp_length,
+            self.y + self.height // 2 - 20  # Near bottom
+        )
+
+        # Ramp ends at the bin
+        self.ramp_end = (
+            self.x - self.width // 2,
+            self.y + self.height // 2 - 20 - math.tan(math.radians(self.ramp_angle)) * self.ramp_length
+        )
+
+        # Dock position is at top of ramp
+        self.dock_position = (
+            self.x - self.width // 2 + 10,
+            self.ramp_end[1]
+        )
+
+        # Dump position is where trash goes
+        self.dump_position = (
+            self.x,
+            self.y - self.height // 4
+        )
+
+        # Ramp collision rect
+        self.ramp_rect = pygame.Rect(
+            int(self.ramp_start[0]),
+            int(self.ramp_end[1]) - 30,
+            int(self.ramp_length),
+            60
+        )
+
+    @property
+    def position(self) -> Tuple[float, float]:
+        """Get center position."""
+        return (self.x, self.y)
+
+    @property
+    def is_full(self) -> bool:
+        """Check if the bin is full."""
+        return self.fill_level >= self.capacity
+
+    @property
+    def fill_percentage(self) -> float:
+        """Get fill level as percentage."""
+        return self.fill_level / self.capacity
+
+    def get_ramp_entry(self) -> Tuple[float, float]:
+        """Get the position where robots should start climbing the ramp."""
+        return self.ramp_start
+
+    def get_dock_position(self) -> Tuple[float, float]:
+        """Get the position where robots dock to dump."""
+        return self.dock_position
+
+    def get_dump_position(self) -> Tuple[float, float]:
+        """Get the position above the bin where trash is released."""
+        return self.dump_position
+
+    def is_robot_at_ramp_entry(self, robot_pos: Tuple[float, float], threshold: float = 30) -> bool:
+        """Check if robot is at the ramp entry point."""
+        dx = robot_pos[0] - self.ramp_start[0]
+        dy = robot_pos[1] - self.ramp_start[1]
+        return math.sqrt(dx * dx + dy * dy) < threshold
+
+    def is_robot_docked(self, robot_pos: Tuple[float, float], threshold: float = 20) -> bool:
+        """Check if robot is properly docked for dumping."""
+        dx = robot_pos[0] - self.dock_position[0]
+        dy = robot_pos[1] - self.dock_position[1]
+        return math.sqrt(dx * dx + dy * dy) < threshold
+
+    def receive_trash(self, count: int) -> int:
+        """
+        Receive trash from a robot.
+
+        Args:
+            count: Number of trash items being dumped
+
+        Returns:
+            Number actually received (might be less if nearly full)
+        """
+        space_available = self.capacity - self.fill_level
+        received = min(count, space_available)
+        self.fill_level += received
+        return received
+
+    def update(self):
+        """Update nest state."""
+        pass
+
+    def draw(self, screen: pygame.Surface):
+        """Draw the nest."""
+        # Draw ramp
+        ramp_points = [
+            self.ramp_start,
+            self.ramp_end,
+            (self.ramp_end[0], self.ramp_end[1] + 15),
+            (self.ramp_start[0], self.ramp_start[1] + 15),
+        ]
+        pygame.draw.polygon(screen, COLOR_RAMP, [(int(p[0]), int(p[1])) for p in ramp_points])
+
+        # Ramp side rails
+        pygame.draw.line(
+            screen, (COLOR_RAMP[0] - 30, COLOR_RAMP[1] - 30, COLOR_RAMP[2] - 30),
+            (int(self.ramp_start[0]), int(self.ramp_start[1]) - 5),
+            (int(self.ramp_end[0]), int(self.ramp_end[1]) - 5),
+            3
+        )
+        pygame.draw.line(
+            screen, (COLOR_RAMP[0] - 30, COLOR_RAMP[1] - 30, COLOR_RAMP[2] - 30),
+            (int(self.ramp_start[0]), int(self.ramp_start[1]) + 20),
+            (int(self.ramp_end[0]), int(self.ramp_end[1]) + 20),
+            3
+        )
+
+        # Draw main bin
+        bin_rect = pygame.Rect(
+            int(self.x - self.width // 2),
+            int(self.y - self.height // 2),
+            self.width,
+            self.height
+        )
+        pygame.draw.rect(screen, COLOR_NEST, bin_rect, border_radius=5)
+
+        # Draw fill level
+        fill_height = int(self.height * self.fill_percentage * 0.8)
+        if fill_height > 0:
+            fill_rect = pygame.Rect(
+                int(self.x - self.width // 2) + 5,
+                int(self.y + self.height // 2) - fill_height - 5,
+                self.width - 10,
+                fill_height
+            )
+            pygame.draw.rect(screen, COLOR_NEST_FILL, fill_rect, border_radius=3)
+
+        # Draw bin opening (top)
+        opening_rect = pygame.Rect(
+            int(self.x - self.width // 2) + 10,
+            int(self.y - self.height // 2) - 5,
+            self.width - 20,
+            15
+        )
+        pygame.draw.rect(screen, (40, 40, 50), opening_rect, border_radius=3)
+
+        # Draw one-way flap (cosmetic)
+        flap_y = int(self.y - self.height // 2) + 5
+        pygame.draw.line(
+            screen, (60, 60, 70),
+            (int(self.x - self.width // 4), flap_y),
+            (int(self.x + self.width // 4), flap_y),
+            2
+        )
+
+        # Draw bin border
+        pygame.draw.rect(screen, (60, 65, 80), bin_rect, 2, border_radius=5)
+
+    def draw_debug(self, screen: pygame.Surface, font: pygame.font.Font):
+        """Draw debug information."""
+        # Draw dock position marker
+        pygame.draw.circle(
+            screen, (0, 255, 255),
+            (int(self.dock_position[0]), int(self.dock_position[1])),
+            8, 2
+        )
+
+        # Draw ramp entry marker
+        pygame.draw.circle(
+            screen, (255, 255, 0),
+            (int(self.ramp_start[0]), int(self.ramp_start[1])),
+            8, 2
+        )
+
+        # Draw fill level text
+        fill_text = f"{self.fill_level}/{self.capacity}"
+        label = font.render(fill_text, True, (255, 255, 255))
+        label_rect = label.get_rect(center=(int(self.x), int(self.y)))
+        screen.blit(label, label_rect)
+
+    def get_rect(self) -> pygame.Rect:
+        """Get collision rectangle."""
+        return self.rect
+
+    def __repr__(self) -> str:
+        return f"Nest(pos={self.position}, fill={self.fill_level}/{self.capacity})"
+</file>
+
+<file path="entities/obstacle.py">
+"""
+Obstacle entity - rocks, walls, and other impassable objects.
+"""
+import pygame
+import random
+from typing import Tuple, Optional
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import (
+    OBSTACLE_SIZE_MIN, OBSTACLE_SIZE_MAX,
+    COLOR_OBSTACLE
+)
+
+
+class Obstacle(pygame.sprite.Sprite):
+    """An impassable obstacle in the environment."""
+
+    TYPES = ['rock', 'wall']
+
+    def __init__(
+        self,
+        position: Tuple[float, float],
+        size: Optional[Tuple[int, int]] = None,
+        obstacle_type: Optional[str] = None
+    ):
+        super().__init__()
+
+        self.x, self.y = position
+        self.obstacle_type = obstacle_type if obstacle_type else random.choice(self.TYPES)
+
+        # Set size
+        if size:
+            self.width, self.height = size
+        else:
+            base_size = random.randint(OBSTACLE_SIZE_MIN, OBSTACLE_SIZE_MAX)
+            if self.obstacle_type == 'wall':
+                # Walls are elongated
+                self.width = base_size * 2
+                self.height = base_size // 2
+            else:
+                # Rocks are roughly square
+                self.width = base_size
+                self.height = base_size
+
+        # Create the sprite image
+        self._create_image()
+
+    def _create_image(self):
+        """Create the visual representation of the obstacle."""
+        self.image = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+
+        if self.obstacle_type == 'wall':
+            # Wall - solid rectangle
+            pygame.draw.rect(
+                self.image, COLOR_OBSTACLE,
+                (0, 0, self.width, self.height)
+            )
+            # Add some texture lines
+            for i in range(0, self.width, 20):
+                pygame.draw.line(
+                    self.image, (COLOR_OBSTACLE[0] - 20, COLOR_OBSTACLE[1] - 20, COLOR_OBSTACLE[2] - 20),
+                    (i, 0), (i, self.height), 1
+                )
+        else:
+            # Rock - irregular polygon
+            # Create a rough circular shape with some randomness
+            center_x = self.width // 2
+            center_y = self.height // 2
+            points = []
+            num_points = 8
+
+            for i in range(num_points):
+                angle = (i / num_points) * 360
+                radius = min(center_x, center_y) * random.uniform(0.7, 1.0)
+                import math
+                x = center_x + radius * math.cos(math.radians(angle))
+                y = center_y + radius * math.sin(math.radians(angle))
+                points.append((x, y))
+
+            pygame.draw.polygon(self.image, COLOR_OBSTACLE, points)
+
+            # Add some shading
+            darker = (COLOR_OBSTACLE[0] - 30, COLOR_OBSTACLE[1] - 30, COLOR_OBSTACLE[2] - 30)
+            # Draw a smaller darker polygon offset
+            offset_points = [(p[0] + 2, p[1] + 2) for p in points[:len(points)//2]]
+            if len(offset_points) >= 3:
+                pygame.draw.polygon(self.image, darker, offset_points + [points[len(points)//2]])
+
+        self.rect = self.image.get_rect()
+        self.rect.center = (int(self.x), int(self.y))
+
+    @property
+    def position(self) -> Tuple[float, float]:
+        """Get current position."""
+        return (self.x, self.y)
+
+    def get_rect(self) -> pygame.Rect:
+        """Get collision rectangle."""
+        return self.rect
+
+    def draw(self, screen: pygame.Surface):
+        """Draw the obstacle on screen."""
+        screen.blit(self.image, self.rect)
+
+    def __repr__(self) -> str:
+        return f"Obstacle({self.obstacle_type}, pos={self.position}, size=({self.width}, {self.height}))"
+</file>
+
+<file path="entities/robot.py">
+"""
+Robot entity - the main WALL-E style garbage collection robot.
+"""
+import pygame
+import math
+from typing import Tuple, Optional, List, TYPE_CHECKING
+from enum import Enum
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import (
+    ROBOT_WIDTH, ROBOT_HEIGHT, ROBOT_SPEED, ROBOT_TURN_SPEED,
+    ROBOT_BIN_CAPACITY, ROBOT_SENSOR_RANGE, ROBOT_GRAB_RANGE,
+    COLOR_ROBOT_BODY, COLOR_ROBOT_TRACKS,
+    LED_PATROL, LED_SEEKING, LED_APPROACHING, LED_PICKING,
+    LED_STORING, LED_RETURNING, LED_DOCKING, LED_DUMPING, LED_IDLE
+)
+from utils.math_helpers import (
+    distance, normalize, angle_to, angle_diff, lerp_angle, rotate_point
+)
+
+if TYPE_CHECKING:
+    from .arm import Arm
+    from .trash import Trash
+
+
+class RobotState(Enum):
+    """States the robot can be in."""
+    PATROL = "patrol"
+    SEEKING = "seeking"
+    APPROACHING = "approaching"
+    PICKING = "picking"
+    STORING = "storing"
+    RETURNING = "returning"
+    DOCKING = "docking"
+    DUMPING = "dumping"
+    IDLE = "idle"
+
+
+# LED colors by state
+STATE_LED_COLORS = {
+    RobotState.PATROL: LED_PATROL,
+    RobotState.SEEKING: LED_SEEKING,
+    RobotState.APPROACHING: LED_APPROACHING,
+    RobotState.PICKING: LED_PICKING,
+    RobotState.STORING: LED_STORING,
+    RobotState.RETURNING: LED_RETURNING,
+    RobotState.DOCKING: LED_DOCKING,
+    RobotState.DUMPING: LED_DUMPING,
+    RobotState.IDLE: LED_IDLE,
+}
+
+
+class Robot(pygame.sprite.Sprite):
+    """
+    A WALL-E style garbage collection robot.
+
+    Features:
+    - Boxy body with tank tracks
+    - LED eyes that change color based on state
+    - Internal bin for storing collected trash
+    - Articulated arm (managed separately)
+    """
+
+    def __init__(self, position: Tuple[float, float], robot_id: int = 0):
+        super().__init__()
+
+        self.id = robot_id
+        self.x, self.y = position
+        self.angle = 0.0  # Facing direction in degrees (0 = right)
+        self.base_speed = ROBOT_SPEED
+        self.speed_modifier = 1.0  # Affected by terrain
+        self.turn_speed = ROBOT_TURN_SPEED
+
+        self.width = ROBOT_WIDTH
+        self.height = ROBOT_HEIGHT
+
+        # State
+        self.state = RobotState.PATROL
+        self.led_color = STATE_LED_COLORS[self.state]
+
+        # Internal bin
+        self.bin_capacity = ROBOT_BIN_CAPACITY
+        self.internal_bin: List['Trash'] = []
+
+        # Arm reference (set by Arm class)
+        self.arm: Optional['Arm'] = None
+
+        # Movement
+        self.target_position: Optional[Tuple[float, float]] = None
+        self.target_angle: Optional[float] = None
+        self.is_moving = False
+
+        # Create collision rect
+        self.rect = pygame.Rect(0, 0, self.width, self.height)
+        self.rect.center = (int(self.x), int(self.y))
+
+    @property
+    def position(self) -> Tuple[float, float]:
+        """Get current position."""
+        return (self.x, self.y)
+
+    @position.setter
+    def position(self, pos: Tuple[float, float]):
+        """Set position."""
+        self.x, self.y = pos
+        self.rect.center = (int(self.x), int(self.y))
+
+    @property
+    def current_speed(self) -> float:
+        """Get current speed including terrain modifier."""
+        return self.base_speed * self.speed_modifier
+
+    @property
+    def bin_count(self) -> int:
+        """Number of items in the bin."""
+        return len(self.internal_bin)
+
+    @property
+    def bin_full(self) -> bool:
+        """Check if bin is at capacity."""
+        return len(self.internal_bin) >= self.bin_capacity
+
+    @property
+    def bin_empty(self) -> bool:
+        """Check if bin is empty."""
+        return len(self.internal_bin) == 0
+
+    def set_state(self, new_state: RobotState):
+        """Change the robot state and update LED color."""
+        self.state = new_state
+        self.led_color = STATE_LED_COLORS.get(new_state, LED_IDLE)
+
+    def set_speed_modifier(self, modifier: float):
+        """Set speed modifier (e.g., from terrain)."""
+        self.speed_modifier = max(0.1, min(1.0, modifier))
+
+    def add_to_bin(self, trash: 'Trash') -> bool:
+        """
+        Add trash to internal bin.
+
+        Args:
+            trash: The trash item to add
+
+        Returns:
+            True if added successfully, False if bin is full
+        """
+        if self.bin_full:
+            return False
+
+        self.internal_bin.append(trash)
+        return True
+
+    def empty_bin(self) -> int:
+        """
+        Empty the internal bin.
+
+        Returns:
+            Number of items emptied
+        """
+        count = len(self.internal_bin)
+        self.internal_bin.clear()
+        return count
+
+    def move_toward(self, target: Tuple[float, float], dt: float = 1.0) -> bool:
+        """
+        Move toward a target position.
+
+        Args:
+            target: Target position (x, y)
+            dt: Delta time multiplier
+
+        Returns:
+            True if reached target
+        """
+        dx = target[0] - self.x
+        dy = target[1] - self.y
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        if dist < 2:  # Close enough
+            return True
+
+        # First rotate toward target
+        target_angle = angle_to(self.position, target)
+        angle_difference = abs(angle_diff(self.angle, target_angle))
+
+        if angle_difference > 5:
+            # Need to rotate first
+            self.rotate_toward(target_angle, dt)
+            # Only move if roughly facing target
+            if angle_difference > 30:
+                return False
+
+        # Move forward
+        move_dist = min(self.current_speed * dt, dist)
+        self.x += (dx / dist) * move_dist
+        self.y += (dy / dist) * move_dist
+        self.rect.center = (int(self.x), int(self.y))
+
+        return dist <= move_dist
+
+    def rotate_toward(self, target_angle: float, dt: float = 1.0):
+        """
+        Rotate toward a target angle.
+
+        Args:
+            target_angle: Target angle in degrees
+            dt: Delta time multiplier
+        """
+        diff = angle_diff(self.angle, target_angle)
+        rotate_amount = min(abs(diff), self.turn_speed * dt)
+
+        if diff > 0:
+            self.angle += rotate_amount
+        else:
+            self.angle -= rotate_amount
+
+        # Normalize angle
+        self.angle = self.angle % 360
+
+    def get_front_position(self) -> Tuple[float, float]:
+        """Get the position in front of the robot."""
+        front_offset = self.width / 2 + 5
+        rad = math.radians(self.angle)
+        return (
+            self.x + math.cos(rad) * front_offset,
+            self.y + math.sin(rad) * front_offset
+        )
+
+    def get_arm_mount_position(self) -> Tuple[float, float]:
+        """Get the position where the arm is mounted."""
+        # Arm mounts at front-center of robot
+        mount_offset = self.width / 2 - 5
+        rad = math.radians(self.angle)
+        return (
+            self.x + math.cos(rad) * mount_offset,
+            self.y + math.sin(rad) * mount_offset
+        )
+
+    def update(self, dt: float = 1.0):
+        """Update robot state."""
+        self.rect.center = (int(self.x), int(self.y))
+
+    def draw(self, screen: pygame.Surface):
+        """Draw the robot."""
+        # Create a surface for the robot that we can rotate
+        surf_size = max(self.width, self.height) + 20
+        robot_surface = pygame.Surface((surf_size, surf_size), pygame.SRCALPHA)
+        center = surf_size // 2
+
+        # Calculate positions relative to center
+        body_rect = pygame.Rect(
+            center - self.width // 2,
+            center - self.height // 2,
+            self.width,
+            self.height
+        )
+
+        # Draw tracks (two rectangles on sides)
+        track_height = 8
+        track_width = self.width - 4
+
+        # Top track
+        track_top = pygame.Rect(
+            center - track_width // 2,
+            center - self.height // 2 - track_height // 2,
+            track_width,
+            track_height
+        )
+        pygame.draw.rect(robot_surface, COLOR_ROBOT_TRACKS, track_top, border_radius=2)
+
+        # Bottom track
+        track_bottom = pygame.Rect(
+            center - track_width // 2,
+            center + self.height // 2 - track_height // 2,
+            track_width,
+            track_height
+        )
+        pygame.draw.rect(robot_surface, COLOR_ROBOT_TRACKS, track_bottom, border_radius=2)
+
+        # Draw body
+        pygame.draw.rect(robot_surface, COLOR_ROBOT_BODY, body_rect, border_radius=4)
+
+        # Draw LED eyes
+        eye_size = 5
+        eye_spacing = 10
+        eye_y = center - 2
+
+        # Left eye
+        pygame.draw.circle(
+            robot_surface, self.led_color,
+            (center + self.width // 4 - eye_spacing // 2, eye_y),
+            eye_size
+        )
+        # Right eye
+        pygame.draw.circle(
+            robot_surface, self.led_color,
+            (center + self.width // 4 + eye_spacing // 2, eye_y),
+            eye_size
+        )
+
+        # Draw direction indicator (small triangle at front)
+        front_x = center + self.width // 2
+        pygame.draw.polygon(
+            robot_surface, COLOR_ROBOT_TRACKS,
+            [
+                (front_x, center),
+                (front_x - 6, center - 4),
+                (front_x - 6, center + 4),
+            ]
+        )
+
+        # Rotate the surface
+        rotated = pygame.transform.rotate(robot_surface, -self.angle)
+        rotated_rect = rotated.get_rect(center=(int(self.x), int(self.y)))
+
+        screen.blit(rotated, rotated_rect)
+
+    def draw_debug(self, screen: pygame.Surface, font: pygame.font.Font):
+        """Draw debug information."""
+        # State label
+        label = font.render(self.state.value.upper(), True, (255, 255, 255))
+        label_rect = label.get_rect(center=(int(self.x), int(self.y) - self.height - 15))
+        screen.blit(label, label_rect)
+
+        # Bin level bar
+        bar_width = 40
+        bar_height = 6
+        bar_x = int(self.x) - bar_width // 2
+        bar_y = int(self.y) + self.height // 2 + 5
+
+        # Background
+        pygame.draw.rect(screen, (50, 50, 50), (bar_x, bar_y, bar_width, bar_height))
+        # Fill
+        fill_width = int(bar_width * (self.bin_count / self.bin_capacity))
+        fill_color = (100, 200, 100) if not self.bin_full else (200, 100, 100)
+        pygame.draw.rect(screen, fill_color, (bar_x, bar_y, fill_width, bar_height))
+        # Border
+        pygame.draw.rect(screen, (150, 150, 150), (bar_x, bar_y, bar_width, bar_height), 1)
+
+    def get_collision_rect(self) -> pygame.Rect:
+        """Get collision rectangle."""
+        return self.rect
+
+    def __repr__(self) -> str:
+        return f"Robot(id={self.id}, pos={self.position}, state={self.state.value}, bin={self.bin_count}/{self.bin_capacity})"
+</file>
+
+<file path="entities/trash.py">
+"""
+Trash entity - collectible items for the robot.
+"""
+import pygame
+import random
+from typing import Tuple, Optional
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import (
+    TRASH_SIZE_MIN, TRASH_SIZE_MAX,
+    COLOR_TRASH, COLOR_TRASH_CAN, COLOR_TRASH_BOTTLE, COLOR_TRASH_PAPER
+)
+
+
+class Trash(pygame.sprite.Sprite):
+    """A piece of trash that can be picked up by a robot."""
+
+    TYPES = ['general', 'can', 'bottle', 'paper']
+    TYPE_COLORS = {
+        'general': COLOR_TRASH,
+        'can': COLOR_TRASH_CAN,
+        'bottle': COLOR_TRASH_BOTTLE,
+        'paper': COLOR_TRASH_PAPER,
+    }
+
+    def __init__(
+        self,
+        position: Tuple[float, float],
+        size: Optional[int] = None,
+        trash_type: Optional[str] = None
+    ):
+        super().__init__()
+
+        self.x, self.y = position
+        self.size = size if size else random.randint(TRASH_SIZE_MIN, TRASH_SIZE_MAX)
+        self.trash_type = trash_type if trash_type else random.choice(self.TYPES)
+        self.is_picked = False
+        self.held_by = None  # Reference to robot holding this trash
+
+        # Create the sprite image
+        self._create_image()
+
+    def _create_image(self):
+        """Create the visual representation of the trash."""
+        diameter = self.size * 2
+        self.image = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
+
+        color = self.TYPE_COLORS.get(self.trash_type, COLOR_TRASH)
+
+        # Draw based on type
+        if self.trash_type == 'can':
+            # Cylindrical can shape (rectangle with rounded ends)
+            rect = pygame.Rect(2, self.size // 2, diameter - 4, self.size)
+            pygame.draw.rect(self.image, color, rect, border_radius=3)
+            pygame.draw.ellipse(self.image, color, (2, 2, diameter - 4, self.size // 2))
+        elif self.trash_type == 'bottle':
+            # Bottle shape (oval with neck)
+            pygame.draw.ellipse(self.image, color, (4, self.size // 2, diameter - 8, self.size))
+            neck_width = diameter // 4
+            pygame.draw.rect(
+                self.image, color,
+                (diameter // 2 - neck_width // 2, 2, neck_width, self.size // 2)
+            )
+        elif self.trash_type == 'paper':
+            # Crumpled paper (irregular polygon)
+            points = [
+                (self.size, 2),
+                (diameter - 4, self.size // 2),
+                (diameter - 2, self.size),
+                (self.size + 2, diameter - 2),
+                (4, self.size + 2),
+                (2, self.size // 2),
+            ]
+            pygame.draw.polygon(self.image, color, points)
+        else:
+            # General trash (circle)
+            pygame.draw.circle(
+                self.image, color,
+                (self.size, self.size),
+                self.size
+            )
+
+        self.rect = self.image.get_rect()
+        self.rect.center = (int(self.x), int(self.y))
+
+    @property
+    def position(self) -> Tuple[float, float]:
+        """Get current position."""
+        return (self.x, self.y)
+
+    @position.setter
+    def position(self, pos: Tuple[float, float]):
+        """Set position."""
+        self.x, self.y = pos
+        self.rect.center = (int(self.x), int(self.y))
+
+    def pick_up(self, robot) -> bool:
+        """
+        Mark this trash as picked up.
+
+        Args:
+            robot: The robot picking up this trash
+
+        Returns:
+            True if successfully picked up, False if already picked
+        """
+        if self.is_picked:
+            return False
+
+        self.is_picked = True
+        self.held_by = robot
+        return True
+
+    def release(self) -> bool:
+        """
+        Release this trash (drop it).
+
+        Returns:
+            True if successfully released
+        """
+        self.is_picked = False
+        self.held_by = None
+        return True
+
+    def update(self):
+        """Update trash state."""
+        # If being held, position is managed by the arm
+        if self.is_picked and self.held_by:
+            # Position will be set by the arm holding it
+            pass
+
+        self.rect.center = (int(self.x), int(self.y))
+
+    def draw(self, screen: pygame.Surface):
+        """Draw the trash on screen."""
+        if not self.is_picked:
+            screen.blit(self.image, self.rect)
+
+    def get_rect(self) -> pygame.Rect:
+        """Get collision rectangle."""
+        return self.rect
+
+    def __repr__(self) -> str:
+        return f"Trash({self.trash_type}, pos={self.position}, picked={self.is_picked})"
+</file>
+
+<file path="systems/__init__.py">
+from .sensors import SensorSystem
+from .behavior import BehaviorController, RobotState
+from .navigation import Navigation
+from .telemetry import Telemetry
+</file>
+
+<file path="systems/behavior.py">
+"""
+Behavior system - robot state machine and decision making.
+"""
+import pygame
+from enum import Enum
+from typing import Optional, List, Tuple, TYPE_CHECKING
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import ROBOT_GRAB_RANGE
+from entities.robot import RobotState
+from entities.arm import ArmState
+from systems.sensors import SensorSystem
+from systems.navigation import Navigation
+from utils.math_helpers import distance, angle_to
+
+if TYPE_CHECKING:
+    from entities.robot import Robot
+    from entities.trash import Trash
+    from entities.nest import Nest
+    from entities.obstacle import Obstacle
+
+
+class BehaviorController:
+    """
+    Controls robot behavior through a state machine.
+
+    States:
+    - PATROL: Following waypoints, looking for trash
+    - SEEKING: Spotted trash, turning toward it
+    - APPROACHING: Moving toward trash
+    - PICKING: Extending arm to grab trash
+    - STORING: Retracting arm, adding trash to bin
+    - RETURNING: Navigating back to nest
+    - DOCKING: Aligning with ramp and climbing
+    - DUMPING: Emptying bin into nest
+    - IDLE: Waiting (error state or manual control)
+    """
+
+    def __init__(
+        self,
+        robot: 'Robot',
+        nest: 'Nest',
+        sensors: SensorSystem = None,
+        navigation: Navigation = None
+    ):
+        self.robot = robot
+        self.nest = nest
+        self.sensors = sensors or SensorSystem()
+        self.navigation = navigation or Navigation()
+
+        # State
+        self.current_state = RobotState.PATROL
+        robot.set_state(self.current_state)
+
+        # Patrol
+        self.patrol_waypoints: List[Tuple[float, float]] = []
+        self.current_waypoint_index = 0
+
+        # Target tracking
+        self.target_trash: Optional['Trash'] = None
+        self.pickup_timer = 0
+        self.dump_timer = 0
+
+        # Generate initial patrol path
+        self._generate_patrol()
+
+    def _generate_patrol(self):
+        """Generate a new patrol path."""
+        self.patrol_waypoints = self.navigation.generate_random_patrol(
+            point_count=6,
+            nest_position=self.nest.position
+        )
+        self.current_waypoint_index = 0
+
+    def transition_to(self, new_state: RobotState):
+        """Transition to a new state."""
+        old_state = self.current_state
+        self.current_state = new_state
+        self.robot.set_state(new_state)
+
+        # State entry actions
+        if new_state == RobotState.PATROL:
+            self.target_trash = None
+            if self.robot.arm:
+                self.robot.arm.retract()
+
+        elif new_state == RobotState.PICKING:
+            self.pickup_timer = 0
+
+        elif new_state == RobotState.DUMPING:
+            self.dump_timer = 0
+
+    def update(
+        self,
+        dt: float,
+        trash_group: pygame.sprite.Group,
+        obstacles: pygame.sprite.Group
+    ):
+        """
+        Update behavior based on current state.
+
+        Args:
+            dt: Delta time
+            trash_group: All trash items
+            obstacles: All obstacles
+        """
+        # Execute current state behavior
+        if self.current_state == RobotState.PATROL:
+            self._execute_patrol(dt, trash_group, obstacles)
+
+        elif self.current_state == RobotState.SEEKING:
+            self._execute_seeking(dt, obstacles)
+
+        elif self.current_state == RobotState.APPROACHING:
+            self._execute_approaching(dt, obstacles)
+
+        elif self.current_state == RobotState.PICKING:
+            self._execute_picking(dt, trash_group)
+
+        elif self.current_state == RobotState.STORING:
+            self._execute_storing(dt)
+
+        elif self.current_state == RobotState.RETURNING:
+            self._execute_returning(dt, obstacles)
+
+        elif self.current_state == RobotState.DOCKING:
+            self._execute_docking(dt)
+
+        elif self.current_state == RobotState.DUMPING:
+            self._execute_dumping(dt)
+
+        elif self.current_state == RobotState.IDLE:
+            pass  # Do nothing
+
+        # Update robot and arm
+        self.robot.update(dt)
+        if self.robot.arm:
+            self.robot.arm.update(dt)
+
+    def _execute_patrol(
+        self,
+        dt: float,
+        trash_group: pygame.sprite.Group,
+        obstacles: pygame.sprite.Group
+    ):
+        """Patrol state: follow waypoints, scan for trash."""
+        # Check for trash
+        nearest_trash = self.sensors.find_nearest_trash(
+            self.robot, trash_group, use_vision_cone=True
+        )
+
+        if nearest_trash and not self.robot.bin_full:
+            self.target_trash = nearest_trash
+            self.transition_to(RobotState.SEEKING)
+            return
+
+        # Check if bin is full and should return
+        if self.robot.bin_full:
+            self.transition_to(RobotState.RETURNING)
+            return
+
+        # Follow patrol path
+        if not self.patrol_waypoints:
+            self._generate_patrol()
+            return
+
+        current_waypoint = self.patrol_waypoints[self.current_waypoint_index]
+
+        # Move toward waypoint with avoidance
+        if self.navigation.is_at_waypoint(self.robot, current_waypoint):
+            # Reached waypoint, go to next
+            self.current_waypoint_index, _ = self.navigation.get_next_waypoint(
+                self.current_waypoint_index,
+                self.patrol_waypoints
+            )
+        else:
+            # Navigate to waypoint
+            move_vec = self.navigation.navigate_to_target(
+                self.robot, current_waypoint, obstacles, dt
+            )
+            self.robot.x += move_vec[0]
+            self.robot.y += move_vec[1]
+            self.robot.rotate_toward(
+                angle_to(self.robot.position, current_waypoint), dt
+            )
+
+    def _execute_seeking(self, dt: float, obstacles: pygame.sprite.Group):
+        """Seeking state: turn toward target trash."""
+        if self.target_trash is None or self.target_trash.is_picked:
+            self.transition_to(RobotState.PATROL)
+            return
+
+        target_angle = angle_to(self.robot.position, self.target_trash.position)
+        self.robot.rotate_toward(target_angle, dt)
+
+        # Check if facing target
+        angle_diff_val = abs(self.robot.angle - target_angle) % 360
+        if angle_diff_val > 180:
+            angle_diff_val = 360 - angle_diff_val
+
+        if angle_diff_val < 15:
+            self.transition_to(RobotState.APPROACHING)
+
+    def _execute_approaching(self, dt: float, obstacles: pygame.sprite.Group):
+        """Approaching state: move toward target trash."""
+        if self.target_trash is None or self.target_trash.is_picked:
+            self.transition_to(RobotState.PATROL)
+            return
+
+        # Get distance from robot front to trash
+        front_pos = self.robot.get_front_position()
+        dist = distance(front_pos, self.target_trash.position)
+
+        # Get close enough for arm to reach (arm is ~55 pixels total)
+        if dist < 50:
+            # Close enough to pick up
+            self.transition_to(RobotState.PICKING)
+            return
+
+        # Move toward trash
+        move_vec = self.navigation.navigate_to_target(
+            self.robot, self.target_trash.position, obstacles, dt
+        )
+        self.robot.x += move_vec[0]
+        self.robot.y += move_vec[1]
+        self.robot.rotate_toward(
+            angle_to(self.robot.position, self.target_trash.position), dt
+        )
+
+    def _execute_picking(self, dt: float, trash_group: pygame.sprite.Group):
+        """Picking state: extend arm and grab trash."""
+        if self.target_trash is None or self.target_trash.is_picked:
+            self.transition_to(RobotState.PATROL)
+            return
+
+        self.pickup_timer += dt
+
+        if self.robot.arm:
+            # Extend arm toward trash
+            if self.robot.arm.state == ArmState.IDLE:
+                self.robot.arm.reach_toward(self.target_trash.position)
+
+            elif self.robot.arm.state == ArmState.EXTENDING:
+                # Keep updating arm target as it extends
+                self.robot.arm.reach_toward(self.target_trash.position)
+
+                # Try to grab when arm is extended enough
+                if self.robot.arm.extension >= 0.7:
+                    if self.robot.arm.pick_up_trash(self.target_trash):
+                        trash_group.remove(self.target_trash)
+                        self.transition_to(RobotState.STORING)
+                    elif self.pickup_timer > 30:  # Timeout faster
+                        self.robot.arm.retract()
+                        self.target_trash = None
+                        self.transition_to(RobotState.PATROL)
+
+            elif self.robot.arm.state == ArmState.HOLDING:
+                self.transition_to(RobotState.STORING)
+        else:
+            # No arm, just "magically" pick up
+            if self.target_trash.pick_up(self.robot):
+                self.robot.add_to_bin(self.target_trash)
+                trash_group.remove(self.target_trash)
+            self.target_trash = None
+            self.transition_to(RobotState.PATROL)
+
+    def _execute_storing(self, dt: float):
+        """Storing state: retract arm and add trash to bin."""
+        if self.robot.arm:
+            if self.robot.arm.state == ArmState.HOLDING:
+                self.robot.arm.retract()
+
+            elif self.robot.arm.state == ArmState.RETRACTING:
+                if self.robot.arm.extension <= 0.1:
+                    # Store the trash
+                    if self.robot.arm.holding:
+                        self.robot.add_to_bin(self.robot.arm.holding)
+                        self.robot.arm.release()
+
+                    self.target_trash = None
+
+                    # Decide next action
+                    if self.robot.bin_full:
+                        self.transition_to(RobotState.RETURNING)
+                    else:
+                        self.transition_to(RobotState.PATROL)
+
+            elif self.robot.arm.state == ArmState.IDLE:
+                self.target_trash = None
+                if self.robot.bin_full:
+                    self.transition_to(RobotState.RETURNING)
+                else:
+                    self.transition_to(RobotState.PATROL)
+        else:
+            self.target_trash = None
+            if self.robot.bin_full:
+                self.transition_to(RobotState.RETURNING)
+            else:
+                self.transition_to(RobotState.PATROL)
+
+    def _execute_returning(self, dt: float, obstacles: pygame.sprite.Group):
+        """Returning state: navigate back to nest."""
+        ramp_entry = self.nest.get_ramp_entry()
+
+        if self.nest.is_robot_at_ramp_entry(self.robot.position):
+            self.transition_to(RobotState.DOCKING)
+            return
+
+        # Navigate to ramp entry
+        move_vec = self.navigation.navigate_to_target(
+            self.robot, ramp_entry, obstacles, dt
+        )
+        self.robot.x += move_vec[0]
+        self.robot.y += move_vec[1]
+        self.robot.rotate_toward(
+            angle_to(self.robot.position, ramp_entry), dt
+        )
+
+    def _execute_docking(self, dt: float):
+        """Docking state: climb ramp and align for dumping."""
+        dock_pos = self.nest.get_dock_position()
+
+        if self.nest.is_robot_docked(self.robot.position):
+            self.transition_to(RobotState.DUMPING)
+            return
+
+        # Move up the ramp (simplified - just move toward dock position)
+        reached = self.robot.move_toward(dock_pos, dt)
+        if reached:
+            self.transition_to(RobotState.DUMPING)
+
+    def _execute_dumping(self, dt: float):
+        """Dumping state: empty bin into nest."""
+        self.dump_timer += dt
+
+        # Animation delay
+        if self.dump_timer < 30:
+            return
+
+        # Dump the trash
+        dumped = self.robot.empty_bin()
+        self.nest.receive_trash(dumped)
+
+        # Wait a bit then return to patrol
+        if self.dump_timer > 60:
+            self._generate_patrol()  # New patrol path
+            self.transition_to(RobotState.PATROL)
+
+    def get_current_waypoint(self) -> Optional[Tuple[float, float]]:
+        """Get the current target waypoint."""
+        if self.patrol_waypoints and 0 <= self.current_waypoint_index < len(self.patrol_waypoints):
+            return self.patrol_waypoints[self.current_waypoint_index]
+        return None
+
+    def draw_debug(self, screen: pygame.Surface, font: pygame.font.Font):
+        """Draw debug visualization."""
+        # Draw patrol path
+        self.navigation.draw_debug(
+            screen,
+            self.patrol_waypoints,
+            self.current_waypoint_index
+        )
+
+        # Draw target trash indicator
+        if self.target_trash and not self.target_trash.is_picked:
+            pygame.draw.circle(
+                screen, (255, 0, 0),
+                (int(self.target_trash.x), int(self.target_trash.y)),
+                self.target_trash.size + 5, 2
+            )
+
+    def __repr__(self) -> str:
+        return f"BehaviorController(state={self.current_state.value})"
+</file>
+
+<file path="systems/navigation.py">
+"""
+Navigation system - patrol paths and obstacle avoidance.
+"""
+import pygame
+import math
+import random
+from typing import List, Tuple, Optional, TYPE_CHECKING
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import SCREEN_WIDTH, SCREEN_HEIGHT, ROBOT_WIDTH, ROBOT_HEIGHT
+from utils.math_helpers import (
+    distance, angle_to, angle_diff, normalize, rotate_point,
+    vector_from_angle, add_vectors, scale_vector
+)
+
+if TYPE_CHECKING:
+    from entities.robot import Robot
+    from entities.obstacle import Obstacle
+    from entities.nest import Nest
+
+
+class Navigation:
+    """
+    Handles robot navigation including:
+    - Patrol path generation
+    - Waypoint following
+    - Obstacle avoidance
+    - Path to target navigation
+    """
+
+    def __init__(
+        self,
+        bounds: Tuple[int, int, int, int] = None,
+        margin: int = 80
+    ):
+        """
+        Args:
+            bounds: (x, y, width, height) of navigable area
+            margin: Distance to keep from edges
+        """
+        if bounds is None:
+            bounds = (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        self.bounds = bounds
+        self.margin = margin
+
+        # Define safe navigation area
+        self.nav_bounds = (
+            bounds[0] + margin,
+            bounds[1] + margin,
+            bounds[2] - margin * 2,
+            bounds[3] - margin * 2
+        )
+
+    def generate_patrol_loop(
+        self,
+        center: Tuple[float, float] = None,
+        radius: float = None,
+        point_count: int = 6
+    ) -> List[Tuple[float, float]]:
+        """
+        Generate a circular patrol path.
+
+        Args:
+            center: Center of patrol area (defaults to screen center)
+            radius: Radius of patrol (defaults to fit in bounds)
+            point_count: Number of waypoints
+
+        Returns:
+            List of waypoint positions
+        """
+        if center is None:
+            center = (
+                self.nav_bounds[0] + self.nav_bounds[2] / 2,
+                self.nav_bounds[1] + self.nav_bounds[3] / 2
+            )
+
+        if radius is None:
+            # Fit within navigation bounds
+            radius = min(self.nav_bounds[2], self.nav_bounds[3]) / 2 - 50
+
+        waypoints = []
+        for i in range(point_count):
+            angle = (i / point_count) * 360
+            rad = math.radians(angle)
+
+            # Add some variation to make it less perfect
+            r = radius * random.uniform(0.8, 1.0)
+
+            x = center[0] + math.cos(rad) * r
+            y = center[1] + math.sin(rad) * r
+
+            # Clamp to bounds
+            x = max(self.nav_bounds[0], min(x, self.nav_bounds[0] + self.nav_bounds[2]))
+            y = max(self.nav_bounds[1], min(y, self.nav_bounds[1] + self.nav_bounds[3]))
+
+            waypoints.append((x, y))
+
+        return waypoints
+
+    def generate_random_patrol(
+        self,
+        point_count: int = 6,
+        nest_position: Tuple[float, float] = None
+    ) -> List[Tuple[float, float]]:
+        """
+        Generate a random patrol path that avoids the nest area.
+
+        Args:
+            point_count: Number of waypoints
+            nest_position: Position of nest to avoid
+
+        Returns:
+            List of waypoint positions
+        """
+        waypoints = []
+        nest_avoid_radius = 200  # Stay this far from nest during patrol
+
+        attempts = 0
+        while len(waypoints) < point_count and attempts < 100:
+            x = random.uniform(self.nav_bounds[0], self.nav_bounds[0] + self.nav_bounds[2])
+            y = random.uniform(self.nav_bounds[1], self.nav_bounds[1] + self.nav_bounds[3])
+
+            # Check if too close to nest
+            if nest_position:
+                dist_to_nest = distance((x, y), nest_position)
+                if dist_to_nest < nest_avoid_radius:
+                    attempts += 1
+                    continue
+
+            # Check if too close to other waypoints
+            too_close = False
+            for wp in waypoints:
+                if distance((x, y), wp) < 100:
+                    too_close = True
+                    break
+
+            if not too_close:
+                waypoints.append((x, y))
+
+            attempts += 1
+
+        return waypoints
+
+    def get_next_waypoint(
+        self,
+        current_index: int,
+        waypoints: List[Tuple[float, float]]
+    ) -> Tuple[int, Tuple[float, float]]:
+        """
+        Get the next waypoint in sequence.
+
+        Args:
+            current_index: Current waypoint index
+            waypoints: List of waypoints
+
+        Returns:
+            (new_index, waypoint_position)
+        """
+        next_index = (current_index + 1) % len(waypoints)
+        return (next_index, waypoints[next_index])
+
+    def calculate_avoidance_steering(
+        self,
+        robot: 'Robot',
+        obstacles: pygame.sprite.Group,
+        look_ahead: float = 60.0
+    ) -> float:
+        """
+        Calculate steering adjustment to avoid obstacles.
+
+        Args:
+            robot: The robot
+            obstacles: Group of obstacles
+            look_ahead: How far ahead to check
+
+        Returns:
+            Steering angle adjustment in degrees
+        """
+        # Cast several rays ahead
+        ray_angles = [-30, -15, 0, 15, 30]
+        ray_weights = [0.5, 0.8, 1.0, 0.8, 0.5]
+
+        avoidance = 0.0
+        closest_hit = look_ahead
+
+        for angle_offset, weight in zip(ray_angles, ray_weights):
+            ray_angle = robot.angle + angle_offset
+            rad = math.radians(ray_angle)
+
+            # Check along the ray
+            for dist in range(10, int(look_ahead), 10):
+                check_x = robot.x + math.cos(rad) * dist
+                check_y = robot.y + math.sin(rad) * dist
+
+                check_rect = pygame.Rect(
+                    check_x - ROBOT_WIDTH / 4,
+                    check_y - ROBOT_HEIGHT / 4,
+                    ROBOT_WIDTH / 2,
+                    ROBOT_HEIGHT / 2
+                )
+
+                hit = False
+                for obstacle in obstacles:
+                    if check_rect.colliderect(obstacle.get_rect()):
+                        hit = True
+                        break
+
+                if hit:
+                    # Calculate avoidance based on which side the obstacle is
+                    if angle_offset < 0:
+                        avoidance += weight * (look_ahead - dist) / look_ahead * 3
+                    elif angle_offset > 0:
+                        avoidance -= weight * (look_ahead - dist) / look_ahead * 3
+
+                    if dist < closest_hit:
+                        closest_hit = dist
+                    break
+
+        return avoidance
+
+    def navigate_to_target(
+        self,
+        robot: 'Robot',
+        target: Tuple[float, float],
+        obstacles: pygame.sprite.Group,
+        dt: float = 1.0
+    ) -> Tuple[float, float]:
+        """
+        Calculate movement vector toward target with obstacle avoidance.
+
+        Args:
+            robot: The robot
+            target: Target position
+            obstacles: Group of obstacles
+            dt: Delta time
+
+        Returns:
+            Movement vector (dx, dy)
+        """
+        # Direct angle to target
+        target_angle = angle_to(robot.position, target)
+
+        # Calculate avoidance
+        avoidance = self.calculate_avoidance_steering(robot, obstacles)
+
+        # Blend target direction with avoidance
+        adjusted_angle = target_angle + avoidance
+
+        # Create movement vector
+        move_vec = vector_from_angle(adjusted_angle, robot.current_speed * dt)
+
+        return move_vec
+
+    def is_at_waypoint(
+        self,
+        robot: 'Robot',
+        waypoint: Tuple[float, float],
+        threshold: float = 20.0
+    ) -> bool:
+        """Check if robot has reached a waypoint."""
+        return distance(robot.position, waypoint) < threshold
+
+    def is_in_bounds(self, position: Tuple[float, float]) -> bool:
+        """Check if a position is within navigation bounds."""
+        x, y = position
+        return (
+            self.nav_bounds[0] <= x <= self.nav_bounds[0] + self.nav_bounds[2] and
+            self.nav_bounds[1] <= y <= self.nav_bounds[1] + self.nav_bounds[3]
+        )
+
+    def clamp_to_bounds(self, position: Tuple[float, float]) -> Tuple[float, float]:
+        """Clamp a position to within navigation bounds."""
+        x = max(self.nav_bounds[0], min(position[0], self.nav_bounds[0] + self.nav_bounds[2]))
+        y = max(self.nav_bounds[1], min(position[1], self.nav_bounds[1] + self.nav_bounds[3]))
+        return (x, y)
+
+    def draw_debug(
+        self,
+        screen: pygame.Surface,
+        waypoints: List[Tuple[float, float]],
+        current_index: int
+    ):
+        """Draw debug visualization of patrol path."""
+        if not waypoints:
+            return
+
+        # Draw lines between waypoints
+        for i in range(len(waypoints)):
+            start = waypoints[i]
+            end = waypoints[(i + 1) % len(waypoints)]
+
+            color = (100, 100, 100)
+            pygame.draw.line(
+                screen, color,
+                (int(start[0]), int(start[1])),
+                (int(end[0]), int(end[1])),
+                1
+            )
+
+        # Draw waypoint markers
+        for i, wp in enumerate(waypoints):
+            if i == current_index:
+                color = (0, 255, 0)  # Current waypoint
+                size = 8
+            else:
+                color = (100, 100, 100)
+                size = 5
+
+            pygame.draw.circle(
+                screen, color,
+                (int(wp[0]), int(wp[1])),
+                size
+            )
+
+            # Draw waypoint number
+            # font = pygame.font.Font(None, 20)
+            # label = font.render(str(i), True, (200, 200, 200))
+            # screen.blit(label, (int(wp[0]) + 10, int(wp[1]) - 10))
+</file>
+
+<file path="systems/sensors.py">
+"""
+Sensor system - collision detection, vision, and distance checks.
+"""
+import pygame
+import math
+from typing import List, Tuple, Optional, TYPE_CHECKING
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import (
+    ROBOT_SENSOR_RANGE, ROBOT_VISION_CONE, ROBOT_GRAB_RANGE,
+    COLOR_DEBUG_SENSOR, COLOR_DEBUG_VISION
+)
+from utils.math_helpers import distance, angle_to, angle_diff, point_in_cone, normalize
+
+if TYPE_CHECKING:
+    from entities.robot import Robot
+    from entities.trash import Trash
+    from entities.obstacle import Obstacle
+    from entities.nest import Nest
+
+
+class SensorSystem:
+    """
+    Handles all sensor-related functionality for robots.
+
+    Includes:
+    - Collision detection
+    - Trash detection (range and vision cone)
+    - Nest detection
+    - Raycast for obstacle avoidance
+    """
+
+    def __init__(self, sensor_range: float = ROBOT_SENSOR_RANGE):
+        self.sensor_range = sensor_range
+        self.vision_cone = ROBOT_VISION_CONE
+        self.grab_range = ROBOT_GRAB_RANGE
+
+    def check_collision(
+        self,
+        robot: 'Robot',
+        obstacles: pygame.sprite.Group
+    ) -> bool:
+        """
+        Check if robot collides with any obstacle.
+
+        Args:
+            robot: The robot to check
+            obstacles: Group of obstacles
+
+        Returns:
+            True if collision detected
+        """
+        robot_rect = robot.get_collision_rect()
+        for obstacle in obstacles:
+            if robot_rect.colliderect(obstacle.get_rect()):
+                return True
+        return False
+
+    def check_collision_at(
+        self,
+        position: Tuple[float, float],
+        size: Tuple[float, float],
+        obstacles: pygame.sprite.Group
+    ) -> bool:
+        """
+        Check collision at a specific position.
+
+        Args:
+            position: Position to check (center)
+            size: Size of the collision box (width, height)
+            obstacles: Group of obstacles
+
+        Returns:
+            True if collision would occur
+        """
+        test_rect = pygame.Rect(
+            position[0] - size[0] / 2,
+            position[1] - size[1] / 2,
+            size[0],
+            size[1]
+        )
+
+        for obstacle in obstacles:
+            if test_rect.colliderect(obstacle.get_rect()):
+                return True
+        return False
+
+    def detect_trash_in_range(
+        self,
+        robot: 'Robot',
+        trash_group: pygame.sprite.Group,
+        range_override: float = None
+    ) -> List['Trash']:
+        """
+        Detect all trash within sensor range.
+
+        Args:
+            robot: The robot doing the sensing
+            trash_group: Group of trash items
+            range_override: Optional custom range
+
+        Returns:
+            List of detected trash items, sorted by distance
+        """
+        detection_range = range_override or self.sensor_range
+        detected = []
+
+        for trash in trash_group:
+            if trash.is_picked:
+                continue
+
+            dist = distance(robot.position, trash.position)
+            if dist <= detection_range:
+                detected.append((dist, trash))
+
+        # Sort by distance and return just the trash objects
+        detected.sort(key=lambda x: x[0])
+        return [t for _, t in detected]
+
+    def detect_trash_in_vision(
+        self,
+        robot: 'Robot',
+        trash_group: pygame.sprite.Group
+    ) -> List['Trash']:
+        """
+        Detect trash within the robot's vision cone.
+
+        Args:
+            robot: The robot doing the sensing
+            trash_group: Group of trash items
+
+        Returns:
+            List of visible trash items, sorted by distance
+        """
+        detected = []
+
+        for trash in trash_group:
+            if trash.is_picked:
+                continue
+
+            if point_in_cone(
+                robot.position,
+                robot.angle,
+                trash.position,
+                self.vision_cone,
+                self.sensor_range
+            ):
+                dist = distance(robot.position, trash.position)
+                detected.append((dist, trash))
+
+        detected.sort(key=lambda x: x[0])
+        return [t for _, t in detected]
+
+    def find_nearest_trash(
+        self,
+        robot: 'Robot',
+        trash_group: pygame.sprite.Group,
+        use_vision_cone: bool = False
+    ) -> Optional['Trash']:
+        """
+        Find the nearest trash item.
+
+        Args:
+            robot: The robot doing the sensing
+            trash_group: Group of trash items
+            use_vision_cone: If True, only check vision cone
+
+        Returns:
+            Nearest trash or None
+        """
+        if use_vision_cone:
+            detected = self.detect_trash_in_vision(robot, trash_group)
+        else:
+            detected = self.detect_trash_in_range(robot, trash_group)
+
+        return detected[0] if detected else None
+
+    def is_trash_in_grab_range(
+        self,
+        robot: 'Robot',
+        trash: 'Trash'
+    ) -> bool:
+        """
+        Check if a specific trash item is within grabbing range.
+
+        Args:
+            robot: The robot
+            trash: The trash to check
+
+        Returns:
+            True if within grab range
+        """
+        # Check distance from robot's arm claw position
+        if robot.arm:
+            claw_pos = robot.arm.get_claw_position()
+            return distance(claw_pos, trash.position) <= self.grab_range
+        else:
+            # Fallback to robot front position
+            front_pos = robot.get_front_position()
+            return distance(front_pos, trash.position) <= self.grab_range
+
+    def is_nest_visible(
+        self,
+        robot: 'Robot',
+        nest: 'Nest',
+        max_distance: float = None
+    ) -> bool:
+        """
+        Check if the nest is visible to the robot.
+
+        Args:
+            robot: The robot
+            nest: The nest
+            max_distance: Maximum detection distance
+
+        Returns:
+            True if nest is visible
+        """
+        max_dist = max_distance or self.sensor_range * 2  # Nest is easier to see
+        return distance(robot.position, nest.position) <= max_dist
+
+    def get_distance_to_nest(
+        self,
+        robot: 'Robot',
+        nest: 'Nest'
+    ) -> float:
+        """Get distance from robot to nest."""
+        return distance(robot.position, nest.position)
+
+    def raycast(
+        self,
+        start: Tuple[float, float],
+        angle: float,
+        max_distance: float,
+        obstacles: pygame.sprite.Group,
+        step_size: float = 5.0
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Cast a ray and find first obstacle hit.
+
+        Args:
+            start: Starting position
+            angle: Direction angle in degrees
+            max_distance: Maximum ray length
+            obstacles: Group of obstacles to check
+            step_size: Step size for ray marching
+
+        Returns:
+            Hit position or None if no hit
+        """
+        rad = math.radians(angle)
+        dx = math.cos(rad) * step_size
+        dy = math.sin(rad) * step_size
+
+        x, y = start
+        traveled = 0
+
+        while traveled < max_distance:
+            x += dx
+            y += dy
+            traveled += step_size
+
+            point = pygame.Rect(x - 1, y - 1, 2, 2)
+            for obstacle in obstacles:
+                if point.colliderect(obstacle.get_rect()):
+                    return (x, y)
+
+        return None
+
+    def check_path_clear(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        obstacles: pygame.sprite.Group
+    ) -> bool:
+        """
+        Check if a direct path is clear of obstacles.
+
+        Args:
+            start: Starting position
+            end: End position
+            obstacles: Group of obstacles
+
+        Returns:
+            True if path is clear
+        """
+        angle = angle_to(start, end)
+        dist = distance(start, end)
+        hit = self.raycast(start, angle, dist, obstacles)
+        return hit is None
+
+    def draw_debug(
+        self,
+        screen: pygame.Surface,
+        robot: 'Robot',
+        show_range: bool = True,
+        show_vision: bool = True
+    ):
+        """Draw debug visualization of sensors."""
+        robot_pos = (int(robot.position[0]), int(robot.position[1]))
+
+        if show_range:
+            # Draw sensor range circle
+            range_surface = pygame.Surface(
+                (self.sensor_range * 2, self.sensor_range * 2),
+                pygame.SRCALPHA
+            )
+            pygame.draw.circle(
+                range_surface,
+                (0, 255, 0, 30),
+                (self.sensor_range, self.sensor_range),
+                int(self.sensor_range)
+            )
+            pygame.draw.circle(
+                range_surface,
+                (0, 255, 0, 100),
+                (self.sensor_range, self.sensor_range),
+                int(self.sensor_range),
+                1
+            )
+            screen.blit(
+                range_surface,
+                (robot_pos[0] - self.sensor_range, robot_pos[1] - self.sensor_range)
+            )
+
+        if show_vision:
+            # Draw vision cone
+            cone_surface = pygame.Surface(
+                (self.sensor_range * 2, self.sensor_range * 2),
+                pygame.SRCALPHA
+            )
+
+            # Vision cone as a pie slice
+            half_cone = self.vision_cone / 2
+            start_angle = math.radians(-robot.angle - half_cone)
+            end_angle = math.radians(-robot.angle + half_cone)
+
+            points = [(self.sensor_range, self.sensor_range)]
+            for a in range(int(-robot.angle - half_cone), int(-robot.angle + half_cone) + 1, 5):
+                rad = math.radians(a)
+                points.append((
+                    self.sensor_range + math.cos(rad) * self.sensor_range,
+                    self.sensor_range + math.sin(rad) * self.sensor_range
+                ))
+            points.append((self.sensor_range, self.sensor_range))
+
+            if len(points) >= 3:
+                pygame.draw.polygon(cone_surface, (255, 200, 0, 40), points)
+                pygame.draw.polygon(cone_surface, (255, 200, 0, 100), points, 1)
+
+            screen.blit(
+                cone_surface,
+                (robot_pos[0] - self.sensor_range, robot_pos[1] - self.sensor_range)
+            )
+</file>
+
+<file path="systems/telemetry.py">
+"""
+Telemetry system - logging and debug visualization.
+"""
+import pygame
+import time
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
+from dataclasses import dataclass, field
+from enum import Enum
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import DEBUG_FONT_SIZE
+
+if TYPE_CHECKING:
+    from entities.robot import Robot
+    from entities.nest import Nest
+
+
+class EventType(Enum):
+    """Types of events that can be logged."""
+    STATE_CHANGE = "state_change"
+    TRASH_PICKUP = "trash_pickup"
+    TRASH_DUMP = "trash_dump"
+    COLLISION = "collision"
+    WAYPOINT_REACHED = "waypoint_reached"
+    ERROR = "error"
+
+
+@dataclass
+class TelemetryEvent:
+    """A single logged event."""
+    timestamp: float
+    event_type: EventType
+    robot_id: int
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+class Telemetry:
+    """
+    Tracks and logs simulation events.
+
+    Features:
+    - Event logging with timestamps
+    - Statistics calculation
+    - Debug overlay rendering
+    - Export to file
+    """
+
+    def __init__(self):
+        self.events: List[TelemetryEvent] = []
+        self.start_time = time.time()
+
+        # Statistics
+        self.stats: Dict[str, Any] = {
+            'total_trash_collected': 0,
+            'total_trash_dumped': 0,
+            'total_distance_traveled': 0,
+            'state_changes': 0,
+            'collisions': 0,
+        }
+
+        # Per-robot stats
+        self.robot_stats: Dict[int, Dict[str, Any]] = {}
+
+        # For distance tracking
+        self.last_positions: Dict[int, tuple] = {}
+
+        # Debug overlay settings
+        self.show_overlay = False
+        self.font: Optional[pygame.font.Font] = None
+
+    def init_font(self):
+        """Initialize the font for rendering."""
+        if self.font is None:
+            self.font = pygame.font.Font(None, DEBUG_FONT_SIZE)
+
+    def get_elapsed_time(self) -> float:
+        """Get elapsed time since simulation start."""
+        return time.time() - self.start_time
+
+    def log(
+        self,
+        event_type: EventType,
+        robot_id: int,
+        data: Dict[str, Any] = None
+    ):
+        """
+        Log an event.
+
+        Args:
+            event_type: Type of event
+            robot_id: ID of the robot involved
+            data: Additional event data
+        """
+        event = TelemetryEvent(
+            timestamp=self.get_elapsed_time(),
+            event_type=event_type,
+            robot_id=robot_id,
+            data=data or {}
+        )
+        self.events.append(event)
+
+        # Update statistics
+        self._update_stats(event)
+
+    def _update_stats(self, event: TelemetryEvent):
+        """Update statistics based on event."""
+        if event.event_type == EventType.TRASH_PICKUP:
+            self.stats['total_trash_collected'] += 1
+            self._get_robot_stats(event.robot_id)['trash_collected'] += 1
+
+        elif event.event_type == EventType.TRASH_DUMP:
+            count = event.data.get('count', 0)
+            self.stats['total_trash_dumped'] += count
+            self._get_robot_stats(event.robot_id)['trash_dumped'] += count
+
+        elif event.event_type == EventType.STATE_CHANGE:
+            self.stats['state_changes'] += 1
+
+        elif event.event_type == EventType.COLLISION:
+            self.stats['collisions'] += 1
+            self._get_robot_stats(event.robot_id)['collisions'] += 1
+
+    def _get_robot_stats(self, robot_id: int) -> Dict[str, Any]:
+        """Get or create stats dict for a robot."""
+        if robot_id not in self.robot_stats:
+            self.robot_stats[robot_id] = {
+                'trash_collected': 0,
+                'trash_dumped': 0,
+                'distance_traveled': 0,
+                'collisions': 0,
+            }
+        return self.robot_stats[robot_id]
+
+    def update_distance(self, robot_id: int, position: tuple):
+        """Update distance traveled for a robot."""
+        if robot_id in self.last_positions:
+            last_pos = self.last_positions[robot_id]
+            dx = position[0] - last_pos[0]
+            dy = position[1] - last_pos[1]
+            dist = (dx * dx + dy * dy) ** 0.5
+
+            self.stats['total_distance_traveled'] += dist
+            self._get_robot_stats(robot_id)['distance_traveled'] += dist
+
+        self.last_positions[robot_id] = position
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics."""
+        return {
+            **self.stats,
+            'elapsed_time': self.get_elapsed_time(),
+            'events_logged': len(self.events),
+            'robot_stats': self.robot_stats.copy(),
+        }
+
+    def get_recent_events(self, count: int = 10) -> List[TelemetryEvent]:
+        """Get the most recent events."""
+        return self.events[-count:]
+
+    def toggle_overlay(self):
+        """Toggle debug overlay visibility."""
+        self.show_overlay = not self.show_overlay
+
+    def draw_overlay(
+        self,
+        screen: pygame.Surface,
+        robots: List['Robot'],
+        nest: 'Nest',
+        fps: float
+    ):
+        """Draw debug overlay on screen."""
+        if not self.show_overlay:
+            return
+
+        self.init_font()
+
+        # Background panel
+        panel_width = 250
+        panel_height = 200
+        panel_surface = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+        pygame.draw.rect(
+            panel_surface, (0, 0, 0, 180),
+            (0, 0, panel_width, panel_height),
+            border_radius=5
+        )
+        screen.blit(panel_surface, (10, 10))
+
+        # Stats text
+        y = 20
+        line_height = 18
+
+        lines = [
+            f"FPS: {fps:.1f}",
+            f"Time: {self.get_elapsed_time():.1f}s",
+            f"",
+            f"Trash Collected: {self.stats['total_trash_collected']}",
+            f"Trash Dumped: {self.stats['total_trash_dumped']}",
+            f"Nest Fill: {nest.fill_level}/{nest.capacity}",
+            f"",
+            f"Distance: {self.stats['total_distance_traveled']:.0f}px",
+            f"Events: {len(self.events)}",
+        ]
+
+        # Add robot-specific info
+        for robot in robots:
+            lines.append(f"")
+            lines.append(f"Robot {robot.id}: {robot.state.value}")
+            lines.append(f"  Bin: {robot.bin_count}/{robot.bin_capacity}")
+
+        for line in lines[:12]:  # Limit lines to fit panel
+            if line:
+                text = self.font.render(line, True, (255, 255, 255))
+                screen.blit(text, (20, y))
+            y += line_height
+
+    def draw_robot_debug(
+        self,
+        screen: pygame.Surface,
+        robot: 'Robot',
+        behavior_controller=None
+    ):
+        """Draw debug info for a specific robot."""
+        if not self.show_overlay:
+            return
+
+        self.init_font()
+
+        # Robot state label is drawn by robot itself
+        robot.draw_debug(screen, self.font)
+
+        # Draw sensor visualization
+        if behavior_controller:
+            behavior_controller.sensors.draw_debug(screen, robot)
+            behavior_controller.draw_debug(screen, self.font)
+
+    def export_log(self, filepath: str):
+        """Export event log to a file."""
+        with open(filepath, 'w') as f:
+            f.write("WALL-E Simulation Telemetry Log\n")
+            f.write(f"Duration: {self.get_elapsed_time():.2f}s\n")
+            f.write(f"Total Events: {len(self.events)}\n")
+            f.write("\n--- Statistics ---\n")
+            for key, value in self.stats.items():
+                f.write(f"{key}: {value}\n")
+            f.write("\n--- Events ---\n")
+            for event in self.events:
+                f.write(
+                    f"[{event.timestamp:.2f}] "
+                    f"Robot {event.robot_id} - "
+                    f"{event.event_type.value}: {event.data}\n"
+                )
+
+    def __repr__(self) -> str:
+        return f"Telemetry(events={len(self.events)}, elapsed={self.get_elapsed_time():.1f}s)"
+</file>
+
+<file path="terrain/__init__.py">
+from .ground import Terrain, TileType
+</file>
+
+<file path="terrain/ground.py">
+"""
+Terrain system - ground tiles with different properties.
+"""
+import pygame
+import random
+from enum import Enum
+from typing import Tuple, List
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import (
+    SCREEN_WIDTH, SCREEN_HEIGHT, TILE_SIZE,
+    MUD_SPEED_MODIFIER, MUD_COVERAGE,
+    COLOR_GROUND, COLOR_MUD, COLOR_DIRT
+)
+
+
+class TileType(Enum):
+    """Types of terrain tiles."""
+    NORMAL = "normal"
+    MUD = "mud"
+    DIRT = "dirt"
+
+
+class Terrain:
+    """
+    Manages the terrain grid with different tile types.
+    Affects robot movement speed based on tile type.
+    """
+
+    TILE_COLORS = {
+        TileType.NORMAL: COLOR_GROUND,
+        TileType.MUD: COLOR_MUD,
+        TileType.DIRT: COLOR_DIRT,
+    }
+
+    SPEED_MODIFIERS = {
+        TileType.NORMAL: 1.0,
+        TileType.MUD: MUD_SPEED_MODIFIER,
+        TileType.DIRT: 0.85,  # Slight slowdown on dirt
+    }
+
+    def __init__(self, width: int = SCREEN_WIDTH, height: int = SCREEN_HEIGHT):
+        self.width = width
+        self.height = height
+        self.tile_size = TILE_SIZE
+
+        self.cols = width // TILE_SIZE
+        self.rows = height // TILE_SIZE
+
+        # 2D grid of tile types
+        self.grid: List[List[TileType]] = []
+
+        # Pre-rendered surface for performance
+        self.surface: pygame.Surface = None
+
+        self.generate_random()
+
+    def generate_random(self):
+        """Generate a random terrain with patches of mud and dirt."""
+        # Initialize all as normal
+        self.grid = [[TileType.NORMAL for _ in range(self.cols)] for _ in range(self.rows)]
+
+        # Add mud patches
+        num_mud_patches = int(self.cols * self.rows * MUD_COVERAGE / 10)
+        for _ in range(num_mud_patches):
+            self._add_patch(TileType.MUD, random.randint(2, 5))
+
+        # Add dirt patches (less than mud)
+        num_dirt_patches = int(self.cols * self.rows * 0.1 / 8)
+        for _ in range(num_dirt_patches):
+            self._add_patch(TileType.DIRT, random.randint(3, 6))
+
+        # Pre-render the terrain
+        self._render_surface()
+
+    def _add_patch(self, tile_type: TileType, size: int):
+        """Add a patch of a specific tile type."""
+        # Random center point
+        center_row = random.randint(0, self.rows - 1)
+        center_col = random.randint(0, self.cols - 1)
+
+        # Fill a rough circular area
+        for dr in range(-size, size + 1):
+            for dc in range(-size, size + 1):
+                # Circular-ish shape with some randomness
+                if dr * dr + dc * dc <= size * size * random.uniform(0.5, 1.2):
+                    row = center_row + dr
+                    col = center_col + dc
+                    if 0 <= row < self.rows and 0 <= col < self.cols:
+                        self.grid[row][col] = tile_type
+
+    def _render_surface(self):
+        """Pre-render the entire terrain to a surface."""
+        self.surface = pygame.Surface((self.width, self.height))
+
+        for row in range(self.rows):
+            for col in range(self.cols):
+                tile_type = self.grid[row][col]
+                color = self.TILE_COLORS[tile_type]
+
+                rect = pygame.Rect(
+                    col * self.tile_size,
+                    row * self.tile_size,
+                    self.tile_size,
+                    self.tile_size
+                )
+                pygame.draw.rect(self.surface, color, rect)
+
+                # Add some texture variation
+                if tile_type == TileType.MUD:
+                    # Draw some darker spots
+                    for _ in range(3):
+                        spot_x = rect.x + random.randint(2, self.tile_size - 2)
+                        spot_y = rect.y + random.randint(2, self.tile_size - 2)
+                        darker = (color[0] - 15, color[1] - 15, color[2] - 10)
+                        pygame.draw.circle(self.surface, darker, (spot_x, spot_y), 2)
+                elif tile_type == TileType.DIRT:
+                    # Draw some specks
+                    for _ in range(2):
+                        spot_x = rect.x + random.randint(2, self.tile_size - 2)
+                        spot_y = rect.y + random.randint(2, self.tile_size - 2)
+                        lighter = (min(255, color[0] + 20), min(255, color[1] + 15), min(255, color[2] + 10))
+                        pygame.draw.circle(self.surface, lighter, (spot_x, spot_y), 1)
+
+    def get_tile_at(self, x: float, y: float) -> TileType:
+        """Get the tile type at a world position."""
+        col = int(x // self.tile_size)
+        row = int(y // self.tile_size)
+
+        if 0 <= row < self.rows and 0 <= col < self.cols:
+            return self.grid[row][col]
+        return TileType.NORMAL  # Default for out of bounds
+
+    def get_speed_modifier(self, x: float, y: float) -> float:
+        """Get the speed modifier at a world position."""
+        tile_type = self.get_tile_at(x, y)
+        return self.SPEED_MODIFIERS.get(tile_type, 1.0)
+
+    def draw(self, screen: pygame.Surface):
+        """Draw the terrain."""
+        screen.blit(self.surface, (0, 0))
+
+    def __repr__(self) -> str:
+        return f"Terrain({self.cols}x{self.rows} tiles)"
+</file>
+
+<file path="utils/__init__.py">
+from .math_helpers import (
+    distance,
+    normalize,
+    angle_to,
+    angle_diff,
+    lerp,
+    lerp_angle,
+    rotate_point,
+    point_in_cone,
+    clamp,
+)
+</file>
+
+<file path="utils/math_helpers.py">
+"""
+Math helper utilities for 2D vector operations.
+"""
+import math
+from typing import Tuple
+
+Point = Tuple[float, float]
+Vector = Tuple[float, float]
+
+
+def distance(a: Point, b: Point) -> float:
+    """Calculate Euclidean distance between two points."""
+    return math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+
+
+def normalize(v: Vector) -> Vector:
+    """Return unit vector. Returns (0, 0) if zero vector."""
+    mag = math.sqrt(v[0] ** 2 + v[1] ** 2)
+    if mag == 0:
+        return (0.0, 0.0)
+    return (v[0] / mag, v[1] / mag)
+
+
+def angle_to(a: Point, b: Point) -> float:
+    """
+    Calculate angle from point a to point b in degrees.
+    0 degrees = right, 90 = down (Pygame coordinates).
+    """
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    return math.degrees(math.atan2(dy, dx))
+
+
+def angle_diff(angle1: float, angle2: float) -> float:
+    """
+    Calculate the shortest angular difference between two angles.
+    Returns value in range [-180, 180].
+    """
+    diff = (angle2 - angle1) % 360
+    if diff > 180:
+        diff -= 360
+    return diff
+
+
+def lerp(a: float, b: float, t: float) -> float:
+    """Linear interpolation between a and b by factor t."""
+    return a + (b - a) * t
+
+
+def lerp_angle(a: float, b: float, t: float) -> float:
+    """
+    Lerp between angles, taking the shortest path.
+    """
+    diff = angle_diff(a, b)
+    return a + diff * t
+
+
+def rotate_point(point: Point, angle: float, origin: Point = (0, 0)) -> Point:
+    """
+    Rotate a point around an origin by angle (degrees).
+    """
+    rad = math.radians(angle)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+
+    # Translate to origin
+    px = point[0] - origin[0]
+    py = point[1] - origin[1]
+
+    # Rotate
+    rx = px * cos_a - py * sin_a
+    ry = px * sin_a + py * cos_a
+
+    # Translate back
+    return (rx + origin[0], ry + origin[1])
+
+
+def point_in_cone(
+    origin: Point,
+    direction_angle: float,
+    target: Point,
+    cone_angle: float,
+    max_distance: float
+) -> bool:
+    """
+    Check if target point is within a vision cone.
+
+    Args:
+        origin: The source point of the cone
+        direction_angle: The direction the cone is facing (degrees)
+        target: The point to check
+        cone_angle: Total cone angle in degrees (e.g., 120 = 60 on each side)
+        max_distance: Maximum range of the cone
+
+    Returns:
+        True if target is within the cone
+    """
+    # Check distance first
+    dist = distance(origin, target)
+    if dist > max_distance or dist == 0:
+        return False
+
+    # Check angle
+    target_angle = angle_to(origin, target)
+    diff = abs(angle_diff(direction_angle, target_angle))
+
+    return diff <= cone_angle / 2
+
+
+def clamp(value: float, min_val: float, max_val: float) -> float:
+    """Clamp value between min and max."""
+    return max(min_val, min(max_val, value))
+
+
+def vector_from_angle(angle: float, magnitude: float = 1.0) -> Vector:
+    """Create a vector from an angle (degrees) and magnitude."""
+    rad = math.radians(angle)
+    return (math.cos(rad) * magnitude, math.sin(rad) * magnitude)
+
+
+def add_vectors(a: Vector, b: Vector) -> Vector:
+    """Add two vectors."""
+    return (a[0] + b[0], a[1] + b[1])
+
+
+def scale_vector(v: Vector, scalar: float) -> Vector:
+    """Scale a vector by a scalar."""
+    return (v[0] * scalar, v[1] * scalar)
+
+
+def dot_product(a: Vector, b: Vector) -> float:
+    """Calculate dot product of two vectors."""
+    return a[0] * b[0] + a[1] * b[1]
+</file>
+
+<file path="config.py">
+# WALL-E Garbage Robot Simulation - Configuration
+# All tunable parameters in one place
+
+# =============================================================================
+# DISPLAY
+# =============================================================================
+SCREEN_WIDTH = 1200
+SCREEN_HEIGHT = 800
+FPS = 30
+
+# =============================================================================
+# ROBOT
+# =============================================================================
+ROBOT_WIDTH = 50
+ROBOT_HEIGHT = 40
+ROBOT_SPEED = 2.0
+ROBOT_TURN_SPEED = 3.0
+ROBOT_BIN_CAPACITY = 10
+ROBOT_SENSOR_RANGE = 150
+ROBOT_GRAB_RANGE = 30
+ROBOT_VISION_CONE = 120  # degrees
+
+# =============================================================================
+# ARM
+# =============================================================================
+ARM_SEGMENT_1_LENGTH = 30
+ARM_SEGMENT_2_LENGTH = 25
+ARM_EXTEND_SPEED = 2.0
+ARM_RETRACT_SPEED = 3.0
+CLAW_SIZE = 12
+
+# =============================================================================
+# NEST
+# =============================================================================
+NEST_WIDTH = 100
+NEST_HEIGHT = 140
+NEST_POSITION = (SCREEN_WIDTH - 150, SCREEN_HEIGHT // 2)
+RAMP_WIDTH = 60
+RAMP_LENGTH = 80
+RAMP_ANGLE = 12
+NEST_CAPACITY = 100
+
+# =============================================================================
+# TRASH
+# =============================================================================
+TRASH_INITIAL_COUNT = 20
+TRASH_SPAWN_INTERVAL = 3.0  # seconds
+TRASH_SIZE_MIN = 8
+TRASH_SIZE_MAX = 20
+
+# =============================================================================
+# TERRAIN
+# =============================================================================
+TILE_SIZE = 40
+MUD_SPEED_MODIFIER = 0.5
+MUD_COVERAGE = 0.15  # 15% of map
+
+# =============================================================================
+# OBSTACLES
+# =============================================================================
+OBSTACLE_COUNT = 8
+OBSTACLE_SIZE_MIN = 30
+OBSTACLE_SIZE_MAX = 60
+
+# =============================================================================
+# COLORS
+# =============================================================================
+COLOR_BG = (30, 35, 30)
+COLOR_ROBOT_BODY = (100, 110, 95)
+COLOR_ROBOT_TRACKS = (50, 50, 50)
+COLOR_CLAW = (70, 70, 80)
+COLOR_CLAW_OPEN = (90, 90, 100)
+COLOR_ARM = (80, 85, 90)
+COLOR_TRASH = (139, 90, 43)
+COLOR_TRASH_CAN = (180, 180, 180)
+COLOR_TRASH_BOTTLE = (100, 180, 100)
+COLOR_TRASH_PAPER = (200, 180, 150)
+COLOR_NEST = (80, 85, 100)
+COLOR_NEST_FILL = (60, 65, 80)
+COLOR_RAMP = (110, 100, 80)
+COLOR_MUD = (60, 45, 30)
+COLOR_DIRT = (80, 60, 40)
+COLOR_GROUND = (45, 55, 40)
+COLOR_OBSTACLE = (90, 90, 90)
+COLOR_DEBUG = (255, 255, 0)
+COLOR_DEBUG_SENSOR = (0, 255, 0, 50)
+COLOR_DEBUG_VISION = (255, 200, 0, 50)
+
+# LED Colors by state
+LED_PATROL = (0, 255, 100)
+LED_SEEKING = (255, 255, 0)
+LED_APPROACHING = (255, 200, 0)
+LED_PICKING = (255, 150, 0)
+LED_STORING = (255, 100, 50)
+LED_RETURNING = (100, 150, 255)
+LED_DOCKING = (150, 150, 255)
+LED_DUMPING = (150, 100, 255)
+LED_IDLE = (100, 100, 100)
+
+# =============================================================================
+# DEBUG
+# =============================================================================
+DEBUG_SHOW_SENSOR_RANGE = True
+DEBUG_SHOW_VISION_CONE = True
+DEBUG_SHOW_PATROL_PATH = True
+DEBUG_SHOW_STATE_LABEL = True
+DEBUG_SHOW_BIN_LEVEL = True
+DEBUG_FONT_SIZE = 16
+</file>
+
+<file path="main.py">
+#!/usr/bin/env python3
+"""
+WALL-E Garbage Robot Simulation
+================================
+
+A Pygame simulation of autonomous garbage collection robots.
+
+Features:
+- Autonomous robot with articulated arm
+- Patrol behavior with trash detection
+- Pickup, store, and dump mechanics
+- Central nest with ramp for dumping
+- Terrain effects (mud slows robot)
+- Debug visualization and telemetry
+
+Controls:
+- F1: Toggle debug overlay
+- SPACE: Pause/Resume simulation
+- R: Reset simulation
+- T: Spawn trash at mouse position
+- ESC: Quit
+
+Usage:
+    python main.py [--robots N]
+
+"""
+import argparse
+import sys
+
+# Ensure we can import from the package
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from simulation import Simulation
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="WALL-E Garbage Robot Simulation"
+    )
+    parser.add_argument(
+        '--robots', '-r',
+        type=int,
+        default=1,
+        help='Number of robots to spawn (default: 1)'
+    )
+    parser.add_argument(
+        '--debug', '-d',
+        action='store_true',
+        help='Start with debug mode enabled'
+    )
+
+    args = parser.parse_args()
+
+    print("=" * 50)
+    print("WALL-E Garbage Robot Simulation")
+    print("=" * 50)
+    print(f"Spawning {args.robots} robot(s)")
+    print()
+    print("Controls:")
+    print("  F1    - Toggle debug overlay")
+    print("  SPACE - Pause/Resume")
+    print("  R     - Reset simulation")
+    print("  T     - Spawn trash at mouse")
+    print("  ESC   - Quit")
+    print("=" * 50)
+    print()
+
+    # Create and run simulation
+    sim = Simulation(robot_count=args.robots)
+
+    if args.debug:
+        sim.debug_mode = True
+        sim.telemetry.show_overlay = True
+
+    sim.run()
+
+    print("Simulation ended.")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="simulation_log.txt">
+WALL-E Simulation Telemetry Log
+Duration: 97.17s
+Total Events: 126
+
+--- Statistics ---
+total_trash_collected: 0
+total_trash_dumped: 0
+total_distance_traveled: 3414.3999999999655
+state_changes: 126
+collisions: 0
+
+--- Events ---
+[2.08] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[2.52] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[3.97] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[4.31] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[4.55] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[4.58] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[4.62] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[5.36] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[5.70] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[5.94] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[15.79] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[16.26] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[17.69] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[18.03] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[18.26] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[22.63] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[22.80] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[24.23] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[24.57] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[24.81] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[24.91] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[25.08] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[26.54] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[26.88] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[27.11] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[31.75] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[31.79] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[33.21] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[33.55] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[33.79] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[33.82] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[33.85] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[34.97] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[35.31] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[35.55] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[35.58] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[35.61] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[36.60] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[36.94] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[37.17] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[37.21] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[37.65] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[38.36] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[38.70] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[38.93] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[47.55] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[47.59] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[49.01] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[49.35] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[49.58] Robot 0 - state_change: {'from': 'storing', 'to': 'returning'}
+[61.11] Robot 0 - state_change: {'from': 'returning', 'to': 'docking'}
+[63.14] Robot 0 - state_change: {'from': 'docking', 'to': 'dumping'}
+[65.21] Robot 0 - state_change: {'from': 'dumping', 'to': 'patrol'}
+[65.51] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[66.02] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[66.90] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[67.24] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[67.48] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[67.51] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[67.99] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[68.02] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[68.36] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[68.60] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[68.63] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[69.14] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[69.18] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[69.52] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[69.75] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[69.79] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[70.26] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[70.47] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[70.80] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[71.04] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[71.08] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[71.11] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[72.43] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[72.77] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[73.01] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[73.62] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[74.13] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[74.64] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[74.97] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[75.21] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[75.24] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[75.28] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[75.31] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[75.65] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[75.88] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[75.92] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[76.23] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[77.58] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[77.92] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[78.16] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[78.19] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[78.23] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[79.48] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[79.82] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[80.05] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[80.09] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[80.53] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[80.97] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[81.31] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[81.55] Robot 0 - state_change: {'from': 'storing', 'to': 'returning'}
+[81.89] Robot 0 - state_change: {'from': 'returning', 'to': 'docking'}
+[84.20] Robot 0 - state_change: {'from': 'docking', 'to': 'dumping'}
+[86.27] Robot 0 - state_change: {'from': 'dumping', 'to': 'patrol'}
+[87.93] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[88.44] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[89.76] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[90.10] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[90.34] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[90.37] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[90.40] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[90.51] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[90.84] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[91.08] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[91.12] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[91.22] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[92.51] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[92.85] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[93.09] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[93.12] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[93.16] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[93.94] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[94.27] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[94.51] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+</file>
+
+<file path="simulation.py">
+"""
+Main simulation - orchestrates all systems and runs the game loop.
+"""
+import pygame
+import random
+from typing import List, Optional
+
+from config import (
+    SCREEN_WIDTH, SCREEN_HEIGHT, FPS,
+    TRASH_INITIAL_COUNT, TRASH_SPAWN_INTERVAL,
+    OBSTACLE_COUNT, COLOR_BG
+)
+from entities.robot import Robot
+from entities.arm import Arm
+from entities.trash import Trash
+from entities.nest import Nest
+from entities.obstacle import Obstacle
+from terrain.ground import Terrain
+from systems.sensors import SensorSystem
+from systems.navigation import Navigation
+from systems.behavior import BehaviorController
+from systems.telemetry import Telemetry, EventType
+
+
+class Simulation:
+    """
+    Main simulation class that runs the WALL-E garbage collection simulation.
+
+    Controls:
+    - F1: Toggle debug overlay
+    - SPACE: Pause/Resume
+    - R: Reset simulation
+    - T: Spawn trash at mouse position
+    - ESC: Quit
+    """
+
+    def __init__(self, robot_count: int = 1):
+        # Initialize Pygame
+        pygame.init()
+        pygame.display.set_caption("WALL-E Garbage Robot Simulation")
+
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, 24)
+
+        self.running = True
+        self.paused = False
+        self.debug_mode = False
+
+        # Initialize systems
+        self.telemetry = Telemetry()
+
+        # Create sprite groups
+        self.trash_group = pygame.sprite.Group()
+        self.obstacle_group = pygame.sprite.Group()
+
+        # Create environment
+        self.terrain = Terrain()
+        self.nest = Nest()
+
+        # Create obstacles
+        self._spawn_obstacles()
+
+        # Create robots
+        self.robots: List[Robot] = []
+        self.behavior_controllers: List[BehaviorController] = []
+        self._spawn_robots(robot_count)
+
+        # Spawn initial trash
+        self._spawn_trash(TRASH_INITIAL_COUNT)
+
+        # Trash spawn timer
+        self.trash_spawn_timer = 0
+
+    def _spawn_obstacles(self):
+        """Spawn random obstacles."""
+        margin = 100
+        nest_avoid = 200
+
+        for _ in range(OBSTACLE_COUNT):
+            attempts = 0
+            while attempts < 50:
+                x = random.randint(margin, SCREEN_WIDTH - margin)
+                y = random.randint(margin, SCREEN_HEIGHT - margin)
+
+                # Avoid spawning near nest
+                dx = x - self.nest.x
+                dy = y - self.nest.y
+                if (dx * dx + dy * dy) < nest_avoid * nest_avoid:
+                    attempts += 1
+                    continue
+
+                obstacle = Obstacle((x, y))
+                self.obstacle_group.add(obstacle)
+                break
+
+    def _spawn_robots(self, count: int):
+        """Spawn robots."""
+        # Spawn in left portion of screen
+        for i in range(count):
+            x = random.randint(100, 300)
+            y = random.randint(100, SCREEN_HEIGHT - 100)
+
+            robot = Robot((x, y), robot_id=i)
+            arm = Arm(robot)
+
+            sensors = SensorSystem()
+            navigation = Navigation()
+            behavior = BehaviorController(robot, self.nest, sensors, navigation)
+
+            self.robots.append(robot)
+            self.behavior_controllers.append(behavior)
+
+            # Initialize telemetry tracking
+            self.telemetry.update_distance(i, (x, y))
+
+    def _spawn_trash(self, count: int):
+        """Spawn random trash items."""
+        margin = 60
+        nest_avoid = 150
+
+        for _ in range(count):
+            attempts = 0
+            while attempts < 50:
+                x = random.randint(margin, SCREEN_WIDTH - margin)
+                y = random.randint(margin, SCREEN_HEIGHT - margin)
+
+                # Avoid spawning near nest
+                dx = x - self.nest.x
+                dy = y - self.nest.y
+                if (dx * dx + dy * dy) < nest_avoid * nest_avoid:
+                    attempts += 1
+                    continue
+
+                # Avoid spawning on obstacles
+                too_close = False
+                for obstacle in self.obstacle_group:
+                    ox, oy = obstacle.position
+                    if abs(x - ox) < 50 and abs(y - oy) < 50:
+                        too_close = True
+                        break
+
+                if not too_close:
+                    trash = Trash((x, y))
+                    self.trash_group.add(trash)
+                    break
+
+                attempts += 1
+
+    def _spawn_trash_at(self, position: tuple):
+        """Spawn a single trash item at a specific position."""
+        trash = Trash(position)
+        self.trash_group.add(trash)
+
+    def handle_events(self):
+        """Handle pygame events."""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+
+                elif event.key == pygame.K_F1:
+                    self.debug_mode = not self.debug_mode
+                    self.telemetry.toggle_overlay()
+
+                elif event.key == pygame.K_SPACE:
+                    self.paused = not self.paused
+
+                elif event.key == pygame.K_r:
+                    self.reset()
+
+                elif event.key == pygame.K_t:
+                    # Spawn trash at mouse position
+                    mouse_pos = pygame.mouse.get_pos()
+                    self._spawn_trash_at(mouse_pos)
+
+    def update(self, dt: float):
+        """Update simulation state."""
+        if self.paused:
+            return
+
+        # Update terrain speed modifiers for robots
+        for robot in self.robots:
+            modifier = self.terrain.get_speed_modifier(robot.x, robot.y)
+            robot.set_speed_modifier(modifier)
+
+        # Update behavior controllers
+        for i, behavior in enumerate(self.behavior_controllers):
+            old_state = behavior.current_state
+            behavior.update(dt, self.trash_group, self.obstacle_group)
+
+            # Log state changes
+            if behavior.current_state != old_state:
+                self.telemetry.log(
+                    EventType.STATE_CHANGE,
+                    self.robots[i].id,
+                    {'from': old_state.value, 'to': behavior.current_state.value}
+                )
+
+            # Update distance tracking
+            self.telemetry.update_distance(
+                self.robots[i].id,
+                self.robots[i].position
+            )
+
+        # Update trash
+        for trash in self.trash_group:
+            trash.update()
+
+        # Spawn new trash periodically
+        self.trash_spawn_timer += dt
+        if self.trash_spawn_timer >= TRASH_SPAWN_INTERVAL * FPS:
+            self._spawn_trash(1)
+            self.trash_spawn_timer = 0
+
+    def draw(self):
+        """Draw everything."""
+        # Draw terrain
+        self.terrain.draw(self.screen)
+
+        # Draw obstacles
+        for obstacle in self.obstacle_group:
+            obstacle.draw(self.screen)
+
+        # Draw nest
+        self.nest.draw(self.screen)
+
+        # Draw trash
+        for trash in self.trash_group:
+            trash.draw(self.screen)
+
+        # Draw robots and arms
+        for robot in self.robots:
+            robot.draw(self.screen)
+            if robot.arm:
+                robot.arm.draw(self.screen)
+
+        # Draw debug overlays
+        if self.debug_mode:
+            self.nest.draw_debug(self.screen, self.font)
+
+            for i, robot in enumerate(self.robots):
+                self.telemetry.draw_robot_debug(
+                    self.screen,
+                    robot,
+                    self.behavior_controllers[i]
+                )
+
+        # Draw telemetry overlay
+        fps = self.clock.get_fps()
+        self.telemetry.draw_overlay(
+            self.screen,
+            self.robots,
+            self.nest,
+            fps
+        )
+
+        # Draw pause indicator
+        if self.paused:
+            pause_text = self.font.render("PAUSED", True, (255, 255, 255))
+            rect = pause_text.get_rect(center=(SCREEN_WIDTH // 2, 30))
+            pygame.draw.rect(
+                self.screen, (0, 0, 0),
+                (rect.x - 10, rect.y - 5, rect.width + 20, rect.height + 10)
+            )
+            self.screen.blit(pause_text, rect)
+
+        # Draw controls hint
+        if not self.debug_mode:
+            hint = self.font.render("F1: Debug | SPACE: Pause | T: Spawn Trash | R: Reset", True, (150, 150, 150))
+            self.screen.blit(hint, (10, SCREEN_HEIGHT - 25))
+
+        pygame.display.flip()
+
+    def reset(self):
+        """Reset the simulation."""
+        # Clear groups
+        self.trash_group.empty()
+        self.obstacle_group.empty()
+
+        # Regenerate terrain
+        self.terrain = Terrain()
+
+        # Reset nest
+        self.nest = Nest()
+
+        # Recreate obstacles
+        self._spawn_obstacles()
+
+        # Reset robots
+        robot_count = len(self.robots)
+        self.robots.clear()
+        self.behavior_controllers.clear()
+        self._spawn_robots(robot_count)
+
+        # Spawn fresh trash
+        self._spawn_trash(TRASH_INITIAL_COUNT)
+
+        # Reset telemetry
+        self.telemetry = Telemetry()
+        self.trash_spawn_timer = 0
+
+    def run(self):
+        """Main simulation loop."""
+        while self.running:
+            dt = 1.0  # Fixed timestep for simplicity
+
+            self.handle_events()
+            self.update(dt)
+            self.draw()
+
+            self.clock.tick(FPS)
+
+        # Cleanup
+        pygame.quit()
+
+        # Export telemetry log
+        try:
+            self.telemetry.export_log("simulation_log.txt")
+            print("Telemetry log exported to simulation_log.txt")
+        except Exception as e:
+            print(f"Failed to export telemetry: {e}")
+</file>
+
+</files>
