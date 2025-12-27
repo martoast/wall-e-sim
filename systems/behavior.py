@@ -5,10 +5,11 @@ Design principles:
 1. Simple: Move toward goal, physics handles collisions
 2. Graceful failure: If stuck, give up and try something else
 3. No cheating: All movement is smooth and visible
+4. PERCEPTION-BASED: Robot sees features, not labels. Decisions made under uncertainty.
 """
 import pygame
 import math
-from typing import Optional, List, Tuple, TYPE_CHECKING
+from typing import Optional, List, Tuple, Dict, TYPE_CHECKING
 
 import sys
 import os
@@ -21,9 +22,15 @@ from systems.sensors import SensorSystem
 from systems.navigation import Navigation
 from utils.math_helpers import distance, angle_to
 
+# Phase 2: Perception-based classification
+from systems.perception import PerceptionSystem, PerceptionResult, create_perception_system
+from systems.classifier import Classifier, ClassificationResult, Decision, create_classifier
+from systems.scoring import ScoringSystem, get_scoring_system
+
 if TYPE_CHECKING:
     from entities.robot import Robot
     from entities.trash import Trash
+    from entities.world_object import WorldObject
     from entities.nest import Nest
     from entities.obstacle import Obstacle
     from systems.coordinator import Coordinator
@@ -31,6 +38,16 @@ if TYPE_CHECKING:
     from systems.shared_map import SharedMap
 
 from systems.telemetry import EventType
+
+
+# =============================================================================
+# DECISION THRESHOLDS
+# =============================================================================
+
+# These determine when the robot acts vs investigates
+CONFIDENT_PICKUP_THRESHOLD = 0.60    # Above this = definitely pick up
+INVESTIGATION_THRESHOLD = 0.35       # Above this = move closer to verify (lowered for tiny trash)
+IGNORE_THRESHOLD = 0.25              # Below this = definitely ignore
 
 
 class BehaviorController:
@@ -48,12 +65,29 @@ class BehaviorController:
         robot: 'Robot',
         nest: 'Nest',
         sensors: SensorSystem = None,
-        navigation: Navigation = None
+        navigation: Navigation = None,
+        difficulty: int = 2
     ):
         self.robot = robot
         self.nest = nest
         self.sensors = sensors or SensorSystem()
         self.navigation = navigation or Navigation()
+
+        # ==============================================
+        # PHASE 2: Perception-based classification
+        # ==============================================
+        self.perception = create_perception_system(difficulty)
+        self.classifier = create_classifier(difficulty)
+        self.scoring = get_scoring_system()
+
+        # Current perception/classification results
+        self._current_perceptions: Dict[int, PerceptionResult] = {}  # object_id -> perception
+        self._current_classifications: Dict[int, ClassificationResult] = {}  # object_id -> classification
+
+        # Investigation tracking
+        self._investigation_target: Optional['WorldObject'] = None
+        self._investigation_start_distance: float = 0.0
+        self._investigation_classification: Optional[ClassificationResult] = None
 
         # State
         self.current_state = RobotState.PATROL
@@ -63,8 +97,10 @@ class BehaviorController:
         self.patrol_waypoints: List[Tuple[float, float]] = []
         self.current_waypoint_index = 0
 
-        # Target tracking
+        # Target tracking (now can be WorldObject or Trash for backwards compat)
         self.target_trash: Optional['Trash'] = None
+        self.target_object: Optional['WorldObject'] = None  # Phase 2 target
+        self._target_classification: Optional[ClassificationResult] = None  # Classification that led to pickup decision
 
         # Timers
         self.pickup_timer = 0
@@ -224,14 +260,146 @@ class BehaviorController:
         self._scan_index = 1  # Index of center position
         self._scan_hold_timer = 0
 
+    # ==============================================
+    # PHASE 2: Perception-based object detection
+    # ==============================================
+
+    def _perceive_and_classify_objects(self, world_objects) -> List[Tuple['WorldObject', PerceptionResult, ClassificationResult]]:
+        """
+        Perceive all visible objects and classify them.
+
+        Returns list of (object, perception, classification) tuples sorted by distance.
+        This is the ONLY way the robot should "see" objects.
+        """
+        results = []
+
+        if world_objects is None:
+            return results
+
+        # Use robot's body angle for full sensor cone coverage
+        # (not scan angle - we want to see everything in the cone, not just where scanning)
+        look_angle = self.robot.angle
+
+        for obj in world_objects:
+            if hasattr(obj, 'is_picked') and obj.is_picked:
+                continue
+
+            # Perceive the object
+            perception = self.perception.perceive(
+                obj,
+                self.robot.position,
+                look_angle
+            )
+
+            if perception is None:
+                continue  # Not visible
+
+            # Classify based on perceived features
+            classification = self.classifier.classify(perception)
+
+            # Record that we saw this object
+            self.scoring.record_seen(obj)
+
+            # Store for later reference
+            self._current_perceptions[obj.id] = perception
+            self._current_classifications[obj.id] = classification
+
+            results.append((obj, perception, classification))
+
+        # Sort by distance (closest first)
+        results.sort(key=lambda x: x[1].distance)
+
+        return results
+
+    def _find_best_target(self, world_objects) -> Optional[Tuple['WorldObject', ClassificationResult, str]]:
+        """
+        Find the best object to target based on perception and classification.
+
+        Returns (object, classification, action) where action is:
+        - 'pickup': Confident it's trash, go pick it up
+        - 'investigate': Uncertain, move closer to verify
+        - None: Nothing worth pursuing
+        """
+        perceived = self._perceive_and_classify_objects(world_objects)
+
+        for obj, perception, classification in perceived:
+            # Skip if we already made a final decision on this object (prevents investigation loop)
+            if obj.id in self.scoring.objects_decided:
+                continue
+
+            # Skip if claimed by another robot
+            if self._coordinator and self._coordinator.is_claimed_by_other(obj, self.robot.id):
+                continue
+
+            # Skip if we don't have line of sight (obstacles blocking)
+            if not self._has_line_of_sight(obj.position):
+                continue
+
+            # Decide based on classification
+            if classification.trash_probability >= CONFIDENT_PICKUP_THRESHOLD:
+                # High confidence - pick it up
+                if classification.confidence >= 0.15:
+                    return (obj, classification, 'pickup')
+
+            elif classification.trash_probability >= INVESTIGATION_THRESHOLD:
+                # Medium confidence - investigate (very low confidence req for tiny objects)
+                if classification.confidence >= 0.1:
+                    return (obj, classification, 'investigate')
+
+            else:
+                # Below threshold - record ignore decision (for scoring)
+                # Only record if we haven't already decided on this object
+                if obj.id not in self.scoring.objects_decided:
+                    self._make_ignore_decision(obj, classification, investigated=False)
+
+        return None
+
+    def _make_pickup_decision(self, obj: 'WorldObject', classification: ClassificationResult, investigated: bool = False):
+        """
+        Make the final decision to pick up an object and record the outcome.
+        """
+        # Record the decision with scoring system
+        outcome = self.scoring.record_pickup(
+            obj,
+            classification,
+            self.robot.id,
+            distance(self.robot.position, obj.position),
+            investigated=investigated
+        )
+
+        # Log for debugging
+        gt = obj.get_ground_truth()
+        if outcome.value == "FP":
+            # False positive - we picked up non-trash!
+            if self._telemetry:
+                self._telemetry.log(EventType.TRASH_PICKUP, self.robot.id,
+                                  {'error': 'false_positive', 'actual': gt.category})
+
+    def _make_ignore_decision(self, obj: 'WorldObject', classification: ClassificationResult, investigated: bool = False):
+        """
+        Record the decision to ignore an object.
+        """
+        outcome = self.scoring.record_ignore(
+            obj,
+            classification,
+            self.robot.id,
+            distance(self.robot.position, obj.position),
+            investigated=investigated
+        )
+
     def _get_current_goal(self) -> Optional[Tuple[float, float]]:
         """Get the current goal position based on state."""
         if self.current_state == RobotState.PATROL:
             if self.patrol_waypoints:
                 return self.patrol_waypoints[self.current_waypoint_index]
         elif self.current_state in [RobotState.SEEKING, RobotState.APPROACHING]:
+            if self.target_object:
+                return self.target_object.position
             if self.target_trash:
                 return self.target_trash.position
+        elif self.current_state == RobotState.INVESTIGATING:
+            if self._investigation_target:
+                return self._investigation_target.position
         elif self.current_state == RobotState.RETURNING:
             # If we have a waypoint to navigate around obstacle, go there first
             if self._return_waypoint:
@@ -804,6 +972,7 @@ class BehaviorController:
             RobotState.PATROL: lambda: self._execute_patrol(dt, trash_group, obstacles),
             RobotState.SEEKING: lambda: self._execute_seeking(dt),
             RobotState.APPROACHING: lambda: self._execute_approaching(dt, obstacles),
+            RobotState.INVESTIGATING: lambda: self._execute_investigating(dt, obstacles),
             RobotState.PICKING: lambda: self._execute_picking(dt, trash_group, obstacles),
             RobotState.STORING: lambda: self._execute_storing(dt),
             RobotState.RETURNING: lambda: self._execute_returning(dt, obstacles),
@@ -830,34 +999,75 @@ class BehaviorController:
         # ==============================================
         self._update_scan()  # Update scanning head movement
 
-        # Check for trash using scanning camera system
+        # ==============================================
+        # PHASE 2: Perception-based object detection
+        # ==============================================
         if not self.robot.bin_full:
-            # Scan for trash at current scan angle
-            spotted_trash = self._scan_for_trash(trash_group)
+            # Try perception-based detection first (Phase 2)
+            # Check if trash_group contains WorldObjects (Phase 2) or Trash (Phase 1)
+            use_perception = False
+            if trash_group and len(trash_group) > 0:
+                first_obj = next(iter(trash_group))
+                # Check if it's a WorldObject by looking for the features attribute
+                use_perception = hasattr(first_obj, 'features')
 
-            if spotted_trash:
-                # Check if claimed by another robot
-                if self._coordinator and self._coordinator.is_claimed_by_other(spotted_trash, self.robot.id):
-                    spotted_trash = None
+            if use_perception:
+                # PHASE 2: Perception-based detection with uncertainty
+                target_result = self._find_best_target(trash_group)
 
-                # Check line of sight (obstacles blocking)
-                elif not self._has_line_of_sight(spotted_trash.position):
-                    spotted_trash = None
+                if target_result:
+                    obj, classification, action = target_result
+                    self._reset_scan_to_center()
+                    self._frames_since_found_trash = 0
+                    self._patrol_loops_without_trash = 0
+                    self._wander_target = None
 
-                # Try to claim it
-                elif self._coordinator:
-                    if not self._coordinator.claim_trash(self.robot.id, spotted_trash):
+                    if action == 'pickup':
+                        # High confidence - go pick it up
+                        self.target_trash = obj
+                        self.target_object = obj
+                        self._target_classification = classification  # Store for scoring
+                        if self._coordinator:
+                            self._coordinator.claim_trash(self.robot.id, obj)
+                        self.transition_to(RobotState.SEEKING)
+                        return
+
+                    elif action == 'investigate':
+                        # Uncertain - move closer to verify
+                        self._investigation_target = obj
+                        self._investigation_start_distance = distance(self.robot.position, obj.position)
+                        self._investigation_classification = classification
+                        if self._coordinator:
+                            self._coordinator.claim_trash(self.robot.id, obj)
+                        self.transition_to(RobotState.INVESTIGATING)
+                        return
+            else:
+                # PHASE 1 FALLBACK: Old scanning system for Trash objects
+                spotted_trash = self._scan_for_trash(trash_group)
+
+                if spotted_trash:
+                    # Check if claimed by another robot
+                    if self._coordinator and self._coordinator.is_claimed_by_other(spotted_trash, self.robot.id):
                         spotted_trash = None
 
-            if spotted_trash:
-                # Found trash! Reset scan and go get it
-                self._reset_scan_to_center()
-                self._frames_since_found_trash = 0
-                self._patrol_loops_without_trash = 0
-                self._wander_target = None  # Cancel wandering
-                self.target_trash = spotted_trash
-                self.transition_to(RobotState.SEEKING)
-                return
+                    # Check line of sight (obstacles blocking)
+                    elif not self._has_line_of_sight(spotted_trash.position):
+                        spotted_trash = None
+
+                    # Try to claim it
+                    elif self._coordinator:
+                        if not self._coordinator.claim_trash(self.robot.id, spotted_trash):
+                            spotted_trash = None
+
+                if spotted_trash:
+                    # Found trash! Reset scan and go get it
+                    self._reset_scan_to_center()
+                    self._frames_since_found_trash = 0
+                    self._patrol_loops_without_trash = 0
+                    self._wander_target = None  # Cancel wandering
+                    self.target_trash = spotted_trash
+                    self.transition_to(RobotState.SEEKING)
+                    return
 
         # If wandering to a new area
         if self._wander_target:
@@ -1002,6 +1212,119 @@ class BehaviorController:
 
         return best_trash
 
+    def _execute_investigating(self, dt: float, obstacles: pygame.sprite.Group):
+        """
+        Investigating: move closer to an uncertain object to get better perception.
+
+        This state is triggered when the robot sees something that MIGHT be trash
+        but isn't confident enough to pick it up or ignore it.
+
+        Process:
+        1. Move closer to the object
+        2. Re-perceive at closer range (better confidence)
+        3. Make final decision: pick up or ignore
+        """
+        if self._investigation_target is None:
+            self.transition_to(RobotState.PATROL)
+            return
+
+        # Check if target was picked by someone else
+        if hasattr(self._investigation_target, 'is_picked') and self._investigation_target.is_picked:
+            self._investigation_target = None
+            self._investigation_classification = None
+            self.transition_to(RobotState.PATROL)
+            return
+
+        target_pos = self._investigation_target.position
+        dist = distance(self.robot.position, target_pos)
+
+        # Re-perceive at current distance
+        perception = self.perception.perceive(
+            self._investigation_target,
+            self.robot.position,
+            self.robot.angle  # Look directly at target
+        )
+
+        if perception is None:
+            # Lost sight of target
+            self._investigation_target = None
+            self._investigation_classification = None
+            self.transition_to(RobotState.PATROL)
+            return
+
+        # Re-classify with updated perception
+        classification = self.classifier.classify(perception)
+        self._investigation_classification = classification
+
+        # Check if we're close enough for a confident decision
+        # (closer = better perception = higher confidence)
+        INVESTIGATION_CLOSE_DISTANCE = 60  # Close enough for good perception
+
+        if dist < INVESTIGATION_CLOSE_DISTANCE:
+            # We're close enough - make final decision
+            self.scoring.record_investigation(self._investigation_target, self.robot.id)
+
+            # Lower threshold since we investigated because we thought it might be trash
+            # If trash_prob > 0.4 at close range, it's probably worth picking up
+            if classification.trash_probability >= 0.4 and classification.confidence >= 0.25:
+                # Decided it's trash - pick it up
+                # Note: Scoring is recorded when pickup actually succeeds in _execute_picking
+                # Store the classification for scoring later
+                self._target_classification = classification
+
+                # Transition to pickup
+                self.target_trash = self._investigation_target
+                self.target_object = self._investigation_target
+
+                # Try to claim it
+                if self._coordinator:
+                    self._coordinator.claim_trash(self.robot.id, self._investigation_target)
+
+                self._investigation_target = None
+                self._investigation_classification = None
+                self.transition_to(RobotState.SEEKING)
+            else:
+                # Decided it's NOT trash - ignore it
+                self._make_ignore_decision(self._investigation_target, classification, investigated=True)
+                self._investigation_target = None
+                self._investigation_classification = None
+                self.transition_to(RobotState.PATROL)
+            return
+
+        # Still too far - check if confidence improved enough
+        if classification.confidence > 0.7:
+            # Got confident enough even at distance
+            if classification.trash_probability >= CONFIDENT_PICKUP_THRESHOLD:
+                # High confidence trash - go pick it up
+                self._target_classification = classification  # Store for scoring
+                self.target_trash = self._investigation_target
+                self.target_object = self._investigation_target
+                if self._coordinator:
+                    self._coordinator.claim_trash(self.robot.id, self._investigation_target)
+                self._investigation_target = None
+                self._investigation_classification = None
+                self.transition_to(RobotState.SEEKING)
+                return
+            elif classification.trash_probability < IGNORE_THRESHOLD:
+                # High confidence NOT trash - ignore
+                self._make_ignore_decision(self._investigation_target, classification, investigated=True)
+                self._investigation_target = None
+                self._investigation_classification = None
+                self.transition_to(RobotState.PATROL)
+                return
+
+        # Move closer to investigate
+        target_angle = angle_to(self.robot.position, target_pos)
+        self.robot.rotate_toward(target_angle, dt)
+
+        # Only move if roughly facing target
+        angle_difference = abs(self.robot.angle - target_angle) % 360
+        if angle_difference > 180:
+            angle_difference = 360 - angle_difference
+
+        if angle_difference < 30:
+            self._move_toward(target_pos, dt)
+
     def _execute_picking(self, dt: float, trash_group: pygame.sprite.Group, obstacles: pygame.sprite.Group):
         """
         Picking: extend arm and grab trash.
@@ -1053,10 +1376,20 @@ class BehaviorController:
             # Try to grab continuously once arm has any extension
             if self.robot.arm.extension >= 0.3:
                 if self.robot.arm.pick_up_trash(self.target_trash):
+                    # Phase 2: Record scoring before removing from group
+                    if hasattr(self.target_trash, 'features') and self._target_classification:
+                        self.scoring.record_pickup(
+                            self.target_trash,
+                            self._target_classification,
+                            self.robot.id,
+                            dist,
+                            investigated=False
+                        )
                     trash_group.remove(self.target_trash)
                     if self._telemetry:
                         self._telemetry.log(EventType.TRASH_PICKUP, self.robot.id,
                                           {'trash_id': self.target_trash.id})
+                    self._target_classification = None  # Clear after recording
                     self.transition_to(RobotState.STORING)
                     return
 
@@ -1076,11 +1409,21 @@ class BehaviorController:
             # No arm - walk up and grab directly (also use capped dt)
             if dist < 25:
                 if self.target_trash.pick_up(self.robot):
+                    # Phase 2: Record scoring before removing from group
+                    if hasattr(self.target_trash, 'features') and self._target_classification:
+                        self.scoring.record_pickup(
+                            self.target_trash,
+                            self._target_classification,
+                            self.robot.id,
+                            dist,
+                            investigated=False
+                        )
                     self.robot.add_to_bin(self.target_trash)
                     trash_group.remove(self.target_trash)
                     if self._telemetry:
                         self._telemetry.log(EventType.TRASH_PICKUP, self.robot.id,
                                           {'trash_id': self.target_trash.id})
+                self._target_classification = None
                 self.target_trash = None
                 self.transition_to(RobotState.PATROL)
             else:

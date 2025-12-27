@@ -1,5 +1,9 @@
 """
 Main simulation - orchestrates all systems and runs the game loop.
+
+Phase 2: Perception-based classification
+- Set use_phase2=True to use WorldObjects with perception uncertainty
+- Set use_phase2=False for backwards-compatible Trash objects
 """
 import pygame
 import random
@@ -23,6 +27,11 @@ from systems.physics import PhysicsSystem
 from systems.coordinator import Coordinator
 from systems.shared_map import SharedMap
 
+# Phase 2: Perception-based objects
+from entities.world_object import WorldObject
+from entities.object_spawner import ObjectSpawner, create_default_spawner, spawn_initial_objects
+from systems.scoring import get_scoring_system, reset_scoring_system
+
 
 class Simulation:
     """
@@ -45,11 +54,13 @@ class Simulation:
         self,
         robot_count: int = 1,
         obstacle_count: int = None,
-        initial_trash: int = None
+        initial_trash: int = None,
+        difficulty: int = 2,
+        use_phase2: bool = True  # Use Phase 2 perception-based objects
     ):
         # Initialize Pygame
         pygame.init()
-        pygame.display.set_caption("WALL-E Garbage Robot Simulation")
+        pygame.display.set_caption("WALL-E Garbage Robot Simulation - Phase 2: Perception Reality")
 
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock = pygame.time.Clock()
@@ -62,9 +73,19 @@ class Simulation:
         self.win_screen_alpha = 0  # For fade-in effect
         self.restart_button_rect = None  # Set when win screen is drawn
 
+        # Phase 2 settings
+        self.use_phase2 = use_phase2
+        self.difficulty = difficulty
+
         # Difficulty settings (use defaults from config if not specified)
         self.obstacle_count = obstacle_count if obstacle_count is not None else OBSTACLE_COUNT
         self.initial_trash_count = initial_trash if initial_trash is not None else TRASH_INITIAL_COUNT
+
+        # Phase 2: Object spawner and scoring
+        if self.use_phase2:
+            self.object_spawner = create_default_spawner(difficulty)
+            reset_scoring_system()
+            self.scoring = get_scoring_system()
 
         # Simulation speed control
         self.speed_multiplier = 1.0
@@ -132,7 +153,10 @@ class Simulation:
 
             sensors = SensorSystem()
             navigation = Navigation()
-            behavior = BehaviorController(robot, self.nest, sensors, navigation)
+            behavior = BehaviorController(
+                robot, self.nest, sensors, navigation,
+                difficulty=self.difficulty
+            )
 
             self.robots.append(robot)
             self.behavior_controllers.append(behavior)
@@ -184,45 +208,70 @@ class Simulation:
         return (100, SCREEN_HEIGHT // 2)
 
     def _spawn_trash(self, count: int):
-        """Spawn random trash items."""
-        margin = 60
-        nest_avoid = 150
+        """Spawn random trash/world objects."""
+        if self.use_phase2:
+            # Phase 2: Use ObjectSpawner for diverse WorldObjects
+            # Gather avoidance info
+            obstacle_positions = [(o.x, o.y) for o in self.obstacle_group]
+            obstacle_radii = [max(o.width, o.height) / 2 + 20 for o in self.obstacle_group]
+            robot_positions = [(r.x, r.y) for r in self.robots]
+            nest_rect = (
+                self.nest.x - self.nest.width / 2 - 30,
+                self.nest.y - self.nest.height / 2 - 30,
+                self.nest.width + 60,
+                self.nest.height + 60
+            )
 
-        for _ in range(count):
-            attempts = 0
-            while attempts < 50:
-                x = random.randint(margin, SCREEN_WIDTH - margin)
-                y = random.randint(margin, SCREEN_HEIGHT - margin)
+            objects = spawn_initial_objects(
+                count,
+                difficulty=self.difficulty,
+                nest_rect=nest_rect,
+                obstacle_positions=obstacle_positions,
+                obstacle_radii=obstacle_radii,
+                robot_positions=robot_positions
+            )
 
-                # Avoid spawning near nest
-                dx = x - self.nest.x
-                dy = y - self.nest.y
-                if (dx * dx + dy * dy) < nest_avoid * nest_avoid:
-                    attempts += 1
-                    continue
+            for obj in objects:
+                self.trash_group.add(obj)
+        else:
+            # Phase 1: Original Trash objects
+            margin = 60
+            nest_avoid = 150
 
-                # Avoid spawning on obstacles
-                too_close = False
-                for obstacle in self.obstacle_group:
-                    ox, oy = obstacle.position
-                    if abs(x - ox) < 50 and abs(y - oy) < 50:
-                        too_close = True
-                        break
+            for _ in range(count):
+                attempts = 0
+                while attempts < 50:
+                    x = random.randint(margin, SCREEN_WIDTH - margin)
+                    y = random.randint(margin, SCREEN_HEIGHT - margin)
 
-                # Avoid spawning on robots (use larger buffer to account for robot size + trash size)
-                if not too_close:
-                    for robot in self.robots:
-                        # Robot is ~50px wide, trash is ~15px, add margin = 80px minimum
-                        if abs(x - robot.x) < 80 and abs(y - robot.y) < 80:
+                    # Avoid spawning near nest
+                    dx = x - self.nest.x
+                    dy = y - self.nest.y
+                    if (dx * dx + dy * dy) < nest_avoid * nest_avoid:
+                        attempts += 1
+                        continue
+
+                    # Avoid spawning on obstacles
+                    too_close = False
+                    for obstacle in self.obstacle_group:
+                        ox, oy = obstacle.position
+                        if abs(x - ox) < 50 and abs(y - oy) < 50:
                             too_close = True
                             break
 
-                if not too_close:
-                    trash = Trash((x, y), trash_type='general')
-                    self.trash_group.add(trash)
-                    break
+                    # Avoid spawning on robots
+                    if not too_close:
+                        for robot in self.robots:
+                            if abs(x - robot.x) < 80 and abs(y - robot.y) < 80:
+                                too_close = True
+                                break
 
-                attempts += 1
+                    if not too_close:
+                        trash = Trash((x, y), trash_type='general')
+                        self.trash_group.add(trash)
+                        break
+
+                    attempts += 1
 
     def _spawn_trash_at(self, position: tuple):
         """Spawn a single trash item at a specific position."""
@@ -233,8 +282,15 @@ class Simulation:
             if abs(x - robot.x) < 80 and abs(y - robot.y) < 80:
                 return  # Skip - too close to robot
 
-        trash = Trash(position, trash_type='general')
-        self.trash_group.add(trash)
+        if self.use_phase2:
+            # Phase 2: Spawn a WorldObject
+            obj = self.object_spawner.spawn_at_position(position)
+            if obj:
+                self.trash_group.add(obj)
+        else:
+            # Phase 1: Spawn a Trash
+            trash = Trash(position, trash_type='general')
+            self.trash_group.add(trash)
 
     def _add_robot(self):
         """Add a new robot to the simulation."""
@@ -246,7 +302,10 @@ class Simulation:
 
         sensors = SensorSystem()
         navigation = Navigation()
-        behavior = BehaviorController(robot, self.nest, sensors, navigation)
+        behavior = BehaviorController(
+            robot, self.nest, sensors, navigation,
+            difficulty=self.difficulty
+        )
 
         self.robots.append(robot)
         self.behavior_controllers.append(behavior)
@@ -537,9 +596,13 @@ class Simulation:
         # Draw nest
         self.nest.draw(self.screen)
 
-        # Draw trash
-        for trash in self.trash_group:
-            trash.draw(self.screen)
+        # Draw trash/world objects
+        for obj in self.trash_group:
+            obj.draw(self.screen)
+
+            # Phase 2: Draw debug info for world objects
+            if self.debug_mode and self.use_phase2 and hasattr(obj, 'draw_debug'):
+                obj.draw_debug(self.screen, self.font)
 
         # Draw robots and arms
         for robot in self.robots:
@@ -572,6 +635,10 @@ class Simulation:
                 fps
             )
 
+            # Phase 2: Draw scoring metrics
+            if self.use_phase2:
+                self._draw_scoring_overlay()
+
         # Draw pause indicator
         if self.paused:
             pause_text = self.font.render("PAUSED", True, (255, 255, 255))
@@ -599,6 +666,67 @@ class Simulation:
             self._draw_win_screen()
 
         pygame.display.flip()
+
+    def _draw_scoring_overlay(self):
+        """Draw Phase 2 scoring metrics in debug mode."""
+        if not self.use_phase2:
+            return
+
+        scoring = get_scoring_system()
+        summary = scoring.get_summary()
+
+        # Position in top-right
+        x = SCREEN_WIDTH - 180
+        y = 50
+
+        # Background
+        bg_rect = pygame.Rect(x - 10, y - 5, 175, 180)
+        pygame.draw.rect(self.screen, (0, 0, 0, 180), bg_rect)
+        pygame.draw.rect(self.screen, (100, 100, 100), bg_rect, 1)
+
+        # Title
+        title = self.font.render("PERCEPTION METRICS", True, (255, 200, 100))
+        self.screen.blit(title, (x, y))
+        y += 25
+
+        # Precision/Recall/F1
+        precision = summary['precision']
+        recall = summary['recall']
+        f1 = summary['f1_score']
+
+        prec_color = (100, 255, 100) if precision > 0.8 else (255, 255, 100) if precision > 0.5 else (255, 100, 100)
+        rec_color = (100, 255, 100) if recall > 0.8 else (255, 255, 100) if recall > 0.5 else (255, 100, 100)
+
+        text = self.font.render(f"Precision: {precision:.1%}", True, prec_color)
+        self.screen.blit(text, (x, y))
+        y += 20
+
+        text = self.font.render(f"Recall: {recall:.1%}", True, rec_color)
+        self.screen.blit(text, (x, y))
+        y += 20
+
+        text = self.font.render(f"F1 Score: {f1:.2f}", True, (200, 200, 200))
+        self.screen.blit(text, (x, y))
+        y += 25
+
+        # Counts
+        tp = summary['true_positives']
+        fp = summary['false_positives']
+        tn = summary['true_negatives']
+        fn = summary['false_negatives']
+
+        text = self.font.render(f"TP: {tp}  FP: {fp}", True, (150, 255, 150) if fp == 0 else (255, 150, 150))
+        self.screen.blit(text, (x, y))
+        y += 20
+
+        text = self.font.render(f"TN: {tn}  FN: {fn}", True, (150, 255, 150) if fn == 0 else (255, 150, 150))
+        self.screen.blit(text, (x, y))
+        y += 25
+
+        # Investigation rate
+        inv_rate = summary['investigation_rate']
+        text = self.font.render(f"Investigated: {inv_rate:.1%}", True, (180, 180, 255))
+        self.screen.blit(text, (x, y))
 
     def reset(self):
         """Reset the simulation."""
@@ -635,6 +763,11 @@ class Simulation:
         self.coordinator = Coordinator()
         self.coordinator.assign_patrol_zones(robot_count, SCREEN_WIDTH, SCREEN_HEIGHT)
         self.shared_map = SharedMap(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # Phase 2: Reset scoring
+        if self.use_phase2:
+            reset_scoring_system()
+            self.scoring = get_scoring_system()
 
     def run(self):
         """Main simulation loop."""

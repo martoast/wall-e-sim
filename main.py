@@ -93,7 +93,9 @@ def main():
     sim = Simulation(
         robot_count=args.robots,
         obstacle_count=difficulty['obstacles'],
-        initial_trash=difficulty['trash']
+        initial_trash=difficulty['trash'],
+        difficulty=args.level,
+        use_phase2=True  # Enable Phase 2 perception-based classification
     )
 
     if args.debug:

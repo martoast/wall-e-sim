@@ -31,6 +31,7 @@ class RobotState(Enum):
     PATROL = "patrol"
     SEEKING = "seeking"
     APPROACHING = "approaching"
+    INVESTIGATING = "investigating"  # Moving closer to uncertain object for better perception
     PICKING = "picking"
     STORING = "storing"
     RETURNING = "returning"
@@ -42,10 +43,13 @@ class RobotState(Enum):
 
 
 # LED colors by state
+LED_INVESTIGATING = (255, 180, 0)  # Orange - uncertain, investigating
+
 STATE_LED_COLORS = {
     RobotState.PATROL: LED_PATROL,
     RobotState.SEEKING: LED_SEEKING,
     RobotState.APPROACHING: LED_APPROACHING,
+    RobotState.INVESTIGATING: LED_INVESTIGATING,
     RobotState.PICKING: LED_PICKING,
     RobotState.STORING: LED_STORING,
     RobotState.RETURNING: LED_RETURNING,
