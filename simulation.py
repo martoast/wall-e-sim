@@ -7,8 +7,7 @@ from typing import List, Optional
 
 from config import (
     SCREEN_WIDTH, SCREEN_HEIGHT, FPS,
-    TRASH_INITIAL_COUNT, TRASH_SPAWN_INTERVAL,
-    OBSTACLE_COUNT, COLOR_BG
+    TRASH_INITIAL_COUNT, OBSTACLE_COUNT, COLOR_BG
 )
 from entities.robot import Robot
 from entities.arm import Arm
@@ -42,7 +41,12 @@ class Simulation:
     - ESC: Quit
     """
 
-    def __init__(self, robot_count: int = 1):
+    def __init__(
+        self,
+        robot_count: int = 1,
+        obstacle_count: int = None,
+        initial_trash: int = None
+    ):
         # Initialize Pygame
         pygame.init()
         pygame.display.set_caption("WALL-E Garbage Robot Simulation")
@@ -57,6 +61,10 @@ class Simulation:
         self.game_won = False
         self.win_screen_alpha = 0  # For fade-in effect
         self.restart_button_rect = None  # Set when win screen is drawn
+
+        # Difficulty settings (use defaults from config if not specified)
+        self.obstacle_count = obstacle_count if obstacle_count is not None else OBSTACLE_COUNT
+        self.initial_trash_count = initial_trash if initial_trash is not None else TRASH_INITIAL_COUNT
 
         # Simulation speed control
         self.speed_multiplier = 1.0
@@ -86,20 +94,17 @@ class Simulation:
         self._spawn_robots(robot_count)
 
         # Spawn initial trash
-        self._spawn_trash(TRASH_INITIAL_COUNT)
+        self._spawn_trash(self.initial_trash_count)
 
         # Assign patrol zones after robots are created
         self.coordinator.assign_patrol_zones(robot_count, SCREEN_WIDTH, SCREEN_HEIGHT)
 
-        # Trash spawn timer
-        self.trash_spawn_timer = 0
-
     def _spawn_obstacles(self):
-        """Spawn random obstacles."""
+        """Spawn random obstacles based on difficulty."""
         margin = 100
         nest_avoid = 200
 
-        for _ in range(OBSTACLE_COUNT):
+        for _ in range(self.obstacle_count):
             attempts = 0
             while attempts < 50:
                 x = random.randint(margin, SCREEN_WIDTH - margin)
@@ -622,7 +627,7 @@ class Simulation:
         self._spawn_robots(robot_count)
 
         # Spawn fresh trash
-        self._spawn_trash(TRASH_INITIAL_COUNT)
+        self._spawn_trash(self.initial_trash_count)
 
         # Reset systems
         self.telemetry = Telemetry()
@@ -630,7 +635,6 @@ class Simulation:
         self.coordinator = Coordinator()
         self.coordinator.assign_patrol_zones(robot_count, SCREEN_WIDTH, SCREEN_HEIGHT)
         self.shared_map = SharedMap(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.trash_spawn_timer = 0
 
     def run(self):
         """Main simulation loop."""
