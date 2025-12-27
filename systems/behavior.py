@@ -1093,6 +1093,24 @@ class BehaviorController:
                     self.transition_to(RobotState.SEEKING)
                     return
 
+        # ==============================================
+        # PRIORITY: Check if we need to dump (before wandering!)
+        # ==============================================
+        # Return to dump if bin full
+        if self.robot.bin_full:
+            self._wander_target = None  # Cancel wandering
+            self._request_dump_or_wait()
+            return
+
+        # If no trash left on ground and we have items in bin, go dump to finish the job
+        if len(trash_group) == 0 and self.robot.bin_count > 0:
+            self._wander_target = None  # Cancel wandering
+            self._request_dump_or_wait()
+            return
+
+        # ==============================================
+        # EXPLORATION: Wander to find more trash
+        # ==============================================
         # If wandering to a new area
         if self._wander_target:
             dist_to_wander = distance(self.robot.position, self._wander_target)
@@ -1111,16 +1129,6 @@ class BehaviorController:
         # If we haven't found trash in a while, wander to a new area
         if self._frames_since_found_trash > self.WANDER_THRESHOLD:
             self._pick_wander_target()
-            return
-
-        # Return to dump if bin full
-        if self.robot.bin_full:
-            self._request_dump_or_wait()
-            return
-
-        # If no trash left on ground and we have items in bin, go dump to finish the job
-        if len(trash_group) == 0 and self.robot.bin_count > 0:
-            self._request_dump_or_wait()
             return
 
         # Follow patrol path
@@ -1476,10 +1484,18 @@ class BehaviorController:
 
     def _decide_after_storing(self):
         """Decide what to do after storing trash."""
+        # Go dump if bin is full
         if self.robot.bin_full:
             self._request_dump_or_wait()
-        else:
-            self.transition_to(RobotState.PATROL)
+            return
+
+        # Also go dump if all trash is picked up (to finish the game)
+        if self._trash_group is not None and len(self._trash_group) == 0:
+            if self.robot.bin_count > 0:
+                self._request_dump_or_wait()
+                return
+
+        self.transition_to(RobotState.PATROL)
 
     def _request_dump_or_wait(self):
         """Request to dump - queue if needed."""
