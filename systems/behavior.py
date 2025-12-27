@@ -157,6 +157,12 @@ class BehaviorController:
         self._scan_positions = [-55, 0, 55, 0]
         self._scan_index = 0
 
+        # ==============================================
+        # WAITING STATE TRACKING
+        # ==============================================
+        self._waiting_frames = 0          # How long we've been waiting
+        self._waiting_timeout = 180       # ~6 seconds at 30fps - max wait before checking queue health
+
         # Generate initial patrol path
         self._generate_patrol()
 
@@ -418,10 +424,10 @@ class BehaviorController:
         Simple ant-like detection: if we're not moving, we're stuck.
         This is more reliable than checking distance to goal.
         """
-        # Only check in movement states
+        # Only check in movement states (including INVESTIGATING - robot needs to approach target)
         if self.current_state not in [RobotState.PATROL, RobotState.APPROACHING,
                                        RobotState.SEEKING, RobotState.RETURNING,
-                                       RobotState.UNDOCKING]:
+                                       RobotState.UNDOCKING, RobotState.INVESTIGATING]:
             self._position_history.clear()
             self._stuck_frames = 0
             return False
@@ -687,6 +693,13 @@ class BehaviorController:
                 self._coordinator.release_claim(self.target_trash.id)
             self.target_trash = None
 
+        # Clear investigation target if any
+        if self._investigation_target:
+            if self._coordinator:
+                self._coordinator.release_claim(self._investigation_target.id)
+            self._investigation_target = None
+            self._investigation_classification = None
+
         self.patrol_waypoints = []
         self._return_waypoint = None
 
@@ -921,8 +934,8 @@ class BehaviorController:
             if new_state == RobotState.PATROL:
                 self._coordinator.release_claim(self.target_trash.id)
 
-        # Leave dump queue if abandoning dump process
         if self._coordinator:
+            # Leave dump queue if abandoning dump process
             if old_state in [RobotState.WAITING, RobotState.RETURNING]:
                 if new_state == RobotState.PATROL:
                     self._coordinator.leave_queue(self.robot.id)
@@ -932,6 +945,14 @@ class BehaviorController:
                 if new_state == RobotState.PATROL:
                     self._coordinator.release_ramp(self.robot.id)
 
+            # Release investigation claim if leaving INVESTIGATING unexpectedly
+            if old_state == RobotState.INVESTIGATING:
+                if new_state == RobotState.PATROL:
+                    if self._investigation_target:
+                        self._coordinator.release_claim(self._investigation_target.id)
+                        self._investigation_target = None
+                        self._investigation_classification = None
+
         # State entry actions
         if new_state == RobotState.PATROL:
             self.target_trash = None
@@ -940,6 +961,9 @@ class BehaviorController:
 
         elif new_state == RobotState.PICKING:
             self.pickup_timer = 0
+
+        elif new_state == RobotState.WAITING:
+            self._waiting_frames = 0  # Reset waiting timer
 
         elif new_state == RobotState.DUMPING:
             self.dump_timer = 0
@@ -1605,12 +1629,48 @@ class BehaviorController:
 
     def _execute_waiting(self, dt: float, obstacles: pygame.sprite.Group):
         """Waiting: stay where you are until it's your turn to dump."""
-        # Check if it's our turn AND ramp is clear
+        self._waiting_frames += 1
+
         if self._coordinator:
+            # Ensure we're in the queue (safety check)
+            queue_pos = self._coordinator.get_queue_position(self.robot.id)
+            if queue_pos < 0:
+                # Not in queue! Re-request dump
+                self._coordinator.request_dump(self.robot.id)
+
+            # Check if it's our turn AND ramp is clear
             if self._coordinator.can_dump(self.robot.id) and self._coordinator.is_ramp_clear():
                 # Our turn! Go to ramp
+                self._waiting_frames = 0
                 self.transition_to(RobotState.RETURNING)
                 return
+
+            # Timeout check - if we've been waiting too long, check queue health
+            if self._waiting_frames > self._waiting_timeout:
+                self._waiting_frames = 0  # Reset timer
+
+                # Check if queue is stale (e.g., robot at front left unexpectedly)
+                queue_len = self._coordinator.get_queue_length()
+                ramp_owner = self._coordinator.get_ramp_owner()
+
+                # If queue has items but ramp is orphaned (owner not in queue),
+                # force-release the ramp
+                if ramp_owner is not None:
+                    owner_in_queue = self._coordinator.get_queue_position(ramp_owner) >= 0
+                    if not owner_in_queue:
+                        # Ramp owner left the queue - force release
+                        self._coordinator.release_ramp(ramp_owner)
+
+                # If we're at front but ramp seems stuck, try to claim it
+                if self._coordinator.can_dump(self.robot.id):
+                    if self._coordinator.claim_ramp(self.robot.id):
+                        self.transition_to(RobotState.RETURNING)
+                        return
+        else:
+            # No coordinator - just go
+            self._waiting_frames = 0
+            self.transition_to(RobotState.RETURNING)
+            return
 
         # Just stop and wait - don't go anywhere
         self.robot.set_velocity(0, 0)
@@ -1651,16 +1711,23 @@ class BehaviorController:
         ramp_entry = self.nest.get_ramp_entry()
 
         # Phase 1: Back down past ramp entry and release it
-        if self._coordinator and self._coordinator.get_ramp_owner() == self.robot.id:
-            clear_pos = (ramp_entry[0] - 50, ramp_entry[1])
-            dist_to_clear = distance(self.robot.position, clear_pos)
+        ramp_released = False
+        if self._coordinator:
+            ramp_owner = self._coordinator.get_ramp_owner()
+            if ramp_owner == self.robot.id:
+                clear_pos = (ramp_entry[0] - 50, ramp_entry[1])
+                dist_to_clear = distance(self.robot.position, clear_pos)
 
-            if dist_to_clear < 25:
-                # Clear of ramp - release it
-                self._coordinator.release_ramp(self.robot.id)
+                if dist_to_clear < 25:
+                    # Clear of ramp - release it
+                    self._coordinator.release_ramp(self.robot.id)
+                    ramp_released = True
+                else:
+                    self.robot.move_toward(clear_pos, dt * 0.8)
+                    return
             else:
-                self.robot.move_toward(clear_pos, dt * 0.8)
-                return
+                # We don't own the ramp anymore (shouldn't happen, but safety)
+                ramp_released = True
 
         # Phase 2: Move to departure zone (above the nest, out of the way)
         # This ensures we don't block robots approaching from the waiting area
@@ -1669,6 +1736,9 @@ class BehaviorController:
 
         if dist_to_departure < 40:
             # Far enough away - now patrol
+            # Safety: ensure ramp is released before leaving undocking state
+            if self._coordinator and self._coordinator.get_ramp_owner() == self.robot.id:
+                self._coordinator.release_ramp(self.robot.id)
             self._generate_patrol()
             self.transition_to(RobotState.PATROL)
             return

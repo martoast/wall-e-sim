@@ -84,6 +84,9 @@ class PhysicsSystem:
                 if not trash.is_picked:
                     self._process_trash_physics(trash, trash_group, obstacles, nest, substep_dt)
 
+        # FINAL: Enforce hard boundaries on all entities (closed system)
+        self._enforce_boundaries(robots, trash_group)
+
     def _process_robot_physics(
         self,
         robot: 'Robot',
@@ -631,7 +634,10 @@ class PhysicsSystem:
 
         This is called every frame and forcibly separates any overlapping pairs.
         Uses multiple iterations to handle chain reactions.
+        Respects screen boundaries - won't push entities out of bounds.
         """
+        margin = SCREEN_MARGIN + 5
+
         # Multiple passes to handle chain separations
         for _ in range(3):
             for robot in robots:
@@ -664,12 +670,34 @@ class PhysicsSystem:
                         nx = dx / dist
                         ny = dy / dist
 
-                        # Push FULLY apart - no partial separation
-                        # Robot moves back, trash moves forward
-                        robot.x -= nx * (overlap * 0.4 + 2)
-                        robot.y -= ny * (overlap * 0.4 + 2)
-                        trash.x += nx * (overlap * 0.6 + 2)
-                        trash.y += ny * (overlap * 0.6 + 2)
+                        # Calculate proposed new positions
+                        robot_push = overlap * 0.4 + 2
+                        trash_push = overlap * 0.6 + 2
+
+                        new_robot_x = robot.x - nx * robot_push
+                        new_robot_y = robot.y - ny * robot_push
+                        new_trash_x = trash.x + nx * trash_push
+                        new_trash_y = trash.y + ny * trash_push
+
+                        # Check if trash would go out of bounds - if so, push robot more
+                        trash_min_x = margin + trash.size
+                        trash_max_x = SCREEN_WIDTH - margin - trash.size
+                        trash_min_y = margin + trash.size
+                        trash_max_y = SCREEN_HEIGHT - margin - trash.size
+
+                        trash_blocked_x = new_trash_x < trash_min_x or new_trash_x > trash_max_x
+                        trash_blocked_y = new_trash_y < trash_min_y or new_trash_y > trash_max_y
+
+                        if trash_blocked_x or trash_blocked_y:
+                            # Can't push trash - push robot the full amount instead
+                            robot.x -= nx * (overlap + 4)
+                            robot.y -= ny * (overlap + 4)
+                        else:
+                            # Normal separation
+                            robot.x = new_robot_x
+                            robot.y = new_robot_y
+                            trash.x = new_trash_x
+                            trash.y = new_trash_y
 
                         robot.rect.center = (int(robot.x), int(robot.y))
                         trash.rect.center = (int(trash.x), int(trash.y))
@@ -701,6 +729,79 @@ class PhysicsSystem:
 
             robot1.rect.center = (int(robot1.x), int(robot1.y))
             robot2.rect.center = (int(robot2.x), int(robot2.y))
+
+    def _enforce_boundaries(self, robots: List['Robot'], trash_group: pygame.sprite.Group):
+        """
+        HARD BOUNDARY ENFORCEMENT - Closed system.
+
+        Called at the end of every physics update to ensure nothing
+        escapes the play area. This is the final authority on positions.
+        """
+        # Use a slightly larger margin for the hard boundary
+        margin = SCREEN_MARGIN + 5
+
+        # Enforce robot boundaries
+        for robot in robots:
+            half_w = robot.width / 2
+            half_h = robot.height / 2
+
+            # Clamp position to valid range
+            min_x = margin + half_w
+            max_x = SCREEN_WIDTH - margin - half_w
+            min_y = margin + half_h
+            max_y = SCREEN_HEIGHT - margin - half_h
+
+            changed = False
+            if robot.x < min_x:
+                robot.x = min_x
+                changed = True
+            elif robot.x > max_x:
+                robot.x = max_x
+                changed = True
+
+            if robot.y < min_y:
+                robot.y = min_y
+                changed = True
+            elif robot.y > max_y:
+                robot.y = max_y
+                changed = True
+
+            if changed:
+                robot.rect.center = (int(robot.x), int(robot.y))
+
+        # Enforce trash boundaries
+        for trash in trash_group:
+            if trash.is_picked:
+                continue
+
+            size = trash.size
+
+            min_x = margin + size
+            max_x = SCREEN_WIDTH - margin - size
+            min_y = margin + size
+            max_y = SCREEN_HEIGHT - margin - size
+
+            changed = False
+            if trash.x < min_x:
+                trash.x = min_x
+                trash.velocity = (0, trash.velocity[1] if hasattr(trash, 'velocity') else 0)
+                changed = True
+            elif trash.x > max_x:
+                trash.x = max_x
+                trash.velocity = (0, trash.velocity[1] if hasattr(trash, 'velocity') else 0)
+                changed = True
+
+            if trash.y < min_y:
+                trash.y = min_y
+                trash.velocity = (trash.velocity[0] if hasattr(trash, 'velocity') else 0, 0)
+                changed = True
+            elif trash.y > max_y:
+                trash.y = max_y
+                trash.velocity = (trash.velocity[0] if hasattr(trash, 'velocity') else 0, 0)
+                changed = True
+
+            if changed:
+                trash.rect.center = (int(trash.x), int(trash.y))
 
     def draw_debug(self, screen: pygame.Surface, robots: List['Robot'], trash_group: pygame.sprite.Group):
         """Draw debug visualization of collision boxes."""

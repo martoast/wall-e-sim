@@ -283,5 +283,21 @@ class Coordinator:
         """Get the robot ID currently on the ramp, or None."""
         return self.robot_on_ramp
 
+    def cleanup_stale_ramp(self):
+        """
+        Clean up stale ramp ownership.
+
+        If the ramp owner is not in the dump queue (meaning they finished
+        or left unexpectedly), release the ramp.
+        """
+        if self.robot_on_ramp is not None:
+            if self.robot_on_ramp not in self.dump_queue:
+                # Ramp owner is not in queue - they must have finished or left
+                self.robot_on_ramp = None
+
+    def force_release_ramp(self):
+        """Force release the ramp regardless of owner. Use with caution."""
+        self.robot_on_ramp = None
+
     def __repr__(self) -> str:
         return f"Coordinator(claims={len(self.trash_claims)}, zones={len(self.patrol_zones)}, queue={len(self.dump_queue)}, ramp={self.robot_on_ramp})"

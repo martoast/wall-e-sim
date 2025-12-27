@@ -122,7 +122,8 @@ class Simulation:
 
     def _spawn_obstacles(self):
         """Spawn random obstacles based on difficulty."""
-        margin = 100
+        from config import SCREEN_MARGIN
+        margin = max(100, SCREEN_MARGIN + 60)  # Respect wall boundaries
         nest_avoid = 200
 
         for _ in range(self.obstacle_count):
@@ -166,7 +167,8 @@ class Simulation:
 
     def _find_valid_robot_spawn(self) -> tuple:
         """Find a spawn position that doesn't overlap obstacles or other robots."""
-        margin = 100
+        from config import SCREEN_MARGIN
+        margin = max(100, SCREEN_MARGIN + 50)  # Respect wall boundaries
         robot_size = 50  # Approximate robot size for collision check
 
         for _ in range(100):  # Max attempts
@@ -204,8 +206,10 @@ class Simulation:
             if valid:
                 return (x, y)
 
-        # Fallback if no valid position found
-        return (100, SCREEN_HEIGHT // 2)
+        # Fallback if no valid position found - ensure it's within bounds
+        from config import SCREEN_MARGIN
+        fallback_margin = max(100, SCREEN_MARGIN + 50)
+        return (fallback_margin, SCREEN_HEIGHT // 2)
 
     def _spawn_trash(self, count: int):
         """Spawn random trash/world objects."""
@@ -235,7 +239,8 @@ class Simulation:
                 self.trash_group.add(obj)
         else:
             # Phase 1: Original Trash objects
-            margin = 60
+            from config import SCREEN_MARGIN
+            margin = max(60, SCREEN_MARGIN + 30)  # Respect wall boundaries
             nest_avoid = 150
 
             for _ in range(count):
@@ -275,7 +280,15 @@ class Simulation:
 
     def _spawn_trash_at(self, position: tuple):
         """Spawn a single trash item at a specific position."""
+        from config import SCREEN_MARGIN
         x, y = position
+        margin = SCREEN_MARGIN + 30  # Keep away from walls
+
+        # Don't spawn outside boundaries
+        if x < margin or x > SCREEN_WIDTH - margin:
+            return
+        if y < margin or y > SCREEN_HEIGHT - margin:
+            return
 
         # Don't spawn on robots
         for robot in self.robots:
@@ -407,6 +420,15 @@ class Simulation:
 
     def _spawn_obstacle_at(self, position: tuple):
         """Spawn an obstacle at a specific position."""
+        from config import SCREEN_MARGIN
+        margin = SCREEN_MARGIN + 50  # Keep obstacles away from walls
+
+        # Don't spawn outside boundaries
+        if position[0] < margin or position[0] > SCREEN_WIDTH - margin:
+            return
+        if position[1] < margin or position[1] > SCREEN_HEIGHT - margin:
+            return
+
         # Check if too close to robots
         for robot in self.robots:
             if abs(position[0] - robot.x) < 60 and abs(position[1] - robot.y) < 60:
@@ -471,6 +493,9 @@ class Simulation:
 
         # Cleanup stale trash claims
         self.coordinator.cleanup_claims(self.trash_group)
+
+        # Cleanup stale ramp ownership (prevents queue deadlock)
+        self.coordinator.cleanup_stale_ramp()
 
         # Update behavior controllers (sets velocities)
         for i, behavior in enumerate(self.behavior_controllers):
@@ -584,10 +609,55 @@ class Simulation:
         button_text_rect = button_text.get_rect(center=self.restart_button_rect.center)
         self.screen.blit(button_text, button_text_rect)
 
+    def _draw_boundary_walls(self):
+        """Draw the boundary walls around the play area."""
+        from config import SCREEN_MARGIN
+
+        margin = SCREEN_MARGIN + 5
+        wall_color = (60, 65, 55)  # Dark gray-green, like industrial walls
+        wall_highlight = (80, 85, 75)
+        wall_shadow = (40, 45, 35)
+        wall_thickness = 12
+
+        # Top wall
+        pygame.draw.rect(self.screen, wall_color,
+                        (0, 0, SCREEN_WIDTH, margin))
+        pygame.draw.line(self.screen, wall_highlight,
+                        (0, margin - 2), (SCREEN_WIDTH, margin - 2), 2)
+        pygame.draw.line(self.screen, wall_shadow,
+                        (0, margin), (SCREEN_WIDTH, margin), 1)
+
+        # Bottom wall
+        pygame.draw.rect(self.screen, wall_color,
+                        (0, SCREEN_HEIGHT - margin, SCREEN_WIDTH, margin))
+        pygame.draw.line(self.screen, wall_shadow,
+                        (0, SCREEN_HEIGHT - margin + 1), (SCREEN_WIDTH, SCREEN_HEIGHT - margin + 1), 2)
+        pygame.draw.line(self.screen, wall_highlight,
+                        (0, SCREEN_HEIGHT - margin - 1), (SCREEN_WIDTH, SCREEN_HEIGHT - margin - 1), 1)
+
+        # Left wall
+        pygame.draw.rect(self.screen, wall_color,
+                        (0, 0, margin, SCREEN_HEIGHT))
+        pygame.draw.line(self.screen, wall_highlight,
+                        (margin - 2, 0), (margin - 2, SCREEN_HEIGHT), 2)
+        pygame.draw.line(self.screen, wall_shadow,
+                        (margin, 0), (margin, SCREEN_HEIGHT), 1)
+
+        # Right wall
+        pygame.draw.rect(self.screen, wall_color,
+                        (SCREEN_WIDTH - margin, 0, margin, SCREEN_HEIGHT))
+        pygame.draw.line(self.screen, wall_shadow,
+                        (SCREEN_WIDTH - margin + 1, 0), (SCREEN_WIDTH - margin + 1, SCREEN_HEIGHT), 2)
+        pygame.draw.line(self.screen, wall_highlight,
+                        (SCREEN_WIDTH - margin - 1, 0), (SCREEN_WIDTH - margin - 1, SCREEN_HEIGHT), 1)
+
     def draw(self):
         """Draw everything."""
         # Draw terrain
         self.terrain.draw(self.screen)
+
+        # Draw boundary walls (closed system)
+        self._draw_boundary_walls()
 
         # Draw obstacles
         for obstacle in self.obstacle_group:

@@ -44,7 +44,7 @@ class SpawnConfig:
 
     # Spatial settings
     min_spacing: float = 25.0  # Minimum distance between objects
-    spawn_margin: float = 50.0  # Distance from screen edges
+    spawn_margin: float = 60.0  # Distance from screen edges (respects wall boundaries)
 
     # Difficulty scaling
     ambiguity_boost: float = 0.0  # Add to ambiguity (higher = harder)
