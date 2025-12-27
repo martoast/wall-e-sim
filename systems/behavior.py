@@ -145,17 +145,17 @@ class BehaviorController:
         self._shared_map: Optional['SharedMap'] = None
 
         # ==============================================
-        # SCANNING SYSTEM - Robot "head" looks around
+        # 360° BODY ROTATION SCANNING SYSTEM
         # ==============================================
-        # Like WALL-E's head moving to scan the environment
-        self._scan_angle = 0.0           # Current scan offset from body angle
-        self._scan_target = 0.0          # Target scan offset (smooth interpolation)
-        self._scan_speed = 4.0           # Degrees per frame to turn "head"
-        self._scan_hold_timer = 0        # Frames held at current position
-        self._scan_hold_duration = 25    # Frames to hold at each scan position
-        # Scan pattern: left, center, right, center (smooth sweep)
-        self._scan_positions = [-55, 0, 55, 0]
-        self._scan_index = 0
+        # Like a real robot: must rotate body to see all directions
+        # The FOV cone always points where the body faces
+        self._is_scanning = False         # Currently doing a 360° scan?
+        self._scan_start_angle = 0.0      # Angle when scan started
+        self._scan_rotation = 0.0         # How many degrees we've rotated so far
+        self._scan_speed = 3.0            # Degrees per frame during scan rotation
+        self._frames_since_scan = 0       # Frames since last 360° scan
+        self._scan_interval = 90          # Do a 360° scan every ~3 seconds (or at waypoints)
+        self._scan_at_waypoint = True     # Also scan when reaching each waypoint
 
         # ==============================================
         # WAITING STATE TRACKING
@@ -193,57 +193,107 @@ class BehaviorController:
         self._tried_both_directions = False
 
     # ==============================================
-    # SCANNING SYSTEM - Active visual search
+    # 360° BODY ROTATION SCANNING - Real robotics approach
     # ==============================================
 
-    def _update_scan(self):
+    def _start_360_scan(self):
         """
-        Update the scanning "head" movement.
+        Start a 360° body rotation scan.
 
-        The robot's camera/head smoothly sweeps left-center-right-center
-        while patrolling, like WALL-E looking around for interesting things.
+        The robot stops moving and rotates in place to scan all directions.
+        Like a real robot with a forward-facing camera.
         """
-        # Smoothly move scan angle toward target
-        angle_diff = self._scan_target - self._scan_angle
-        if abs(angle_diff) > self._scan_speed:
-            # Still moving toward target
-            self._scan_angle += self._scan_speed if angle_diff > 0 else -self._scan_speed
-        else:
-            # Reached target - hold position then move to next
-            self._scan_angle = self._scan_target
-            self._scan_hold_timer += 1
+        self._is_scanning = True
+        self._scan_start_angle = self.robot.angle
+        self._scan_rotation = 0.0
+        self._frames_since_scan = 0
 
-            if self._scan_hold_timer >= self._scan_hold_duration:
-                # Move to next scan position
-                self._scan_hold_timer = 0
-                self._scan_index = (self._scan_index + 1) % len(self._scan_positions)
-                self._scan_target = self._scan_positions[self._scan_index]
+    def _update_360_scan(self, dt: float, trash_group) -> bool:
+        """
+        Update the 360° scanning rotation.
+
+        Returns:
+            True if scan is complete, False if still scanning
+        """
+        if not self._is_scanning:
+            return True
+
+        # Rotate the body
+        rotation_amount = self._scan_speed * dt
+        self.robot.angle = (self.robot.angle + rotation_amount) % 360
+        self._scan_rotation += rotation_amount
+
+        # Check if we've completed 360°
+        if self._scan_rotation >= 360:
+            self._is_scanning = False
+            self._frames_since_scan = 0
+            return True
+
+        # During rotation, check for trash in our FOV
+        # Perception uses robot.angle (body direction = FOV direction)
+        target_result = self._find_best_target(trash_group)
+
+        if target_result:
+            obj, classification, action = target_result
+            self._is_scanning = False  # Stop scanning, we found something!
+            self._frames_since_scan = 0
+
+            if action == 'pickup':
+                self.target_trash = obj
+                self.target_object = obj
+                self._target_classification = classification
+                if self._coordinator:
+                    self._coordinator.claim_trash(self.robot.id, obj)
+                self.transition_to(RobotState.SEEKING)
+                return True
+
+            elif action == 'investigate':
+                self._investigation_target = obj
+                self._investigation_start_distance = distance(self.robot.position, obj.position)
+                self._investigation_classification = classification
+                if self._coordinator:
+                    self._coordinator.claim_trash(self.robot.id, obj)
+                self.transition_to(RobotState.INVESTIGATING)
+                return True
+
+        return False  # Still scanning
+
+    def _should_start_scan(self) -> bool:
+        """Check if it's time to do a 360° scan."""
+        if self._is_scanning:
+            return False
+        return self._frames_since_scan >= self._scan_interval
 
     def _get_scan_look_angle(self) -> float:
-        """Get the current direction the robot is 'looking' (body angle + scan offset)."""
-        return self.robot.angle + self._scan_angle
+        """
+        Get the direction the robot is looking.
+
+        FOV always matches body direction - no separate head panning.
+        This is where the yellow cone points.
+        """
+        return self.robot.angle
 
     def _scan_for_trash(self, trash_group: pygame.sprite.Group) -> Optional['Trash']:
         """
-        Scan for trash at the current scan angle.
+        Scan for trash in the robot's current field of view.
 
-        Uses the robot's vision cone but oriented at the scan angle,
-        not the body angle. This simulates a camera/head that can
-        turn independently of the body.
+        FOV = body direction. The robot's "eyes" look where the body faces.
+        For 360° coverage, the robot must physically rotate its body.
 
         Returns:
             Nearest visible trash, or None
         """
         from utils.math_helpers import point_in_cone
 
-        look_angle = self._get_scan_look_angle()
+        # FOV always matches body direction
+        look_angle = self.robot.angle
         detected = []
 
         for trash in trash_group:
             if trash.is_picked:
                 continue
 
-            # Check if trash is in vision cone at SCAN angle (not body angle)
+            # Check if trash is in vision cone (body direction)
             if point_in_cone(
                 self.robot.position,
                 look_angle,
@@ -261,10 +311,10 @@ class BehaviorController:
         return None
 
     def _reset_scan_to_center(self):
-        """Reset scanning to look forward (used when trash found)."""
-        self._scan_target = 0
-        self._scan_index = 1  # Index of center position
-        self._scan_hold_timer = 0
+        """Reset scanning state (called when trash is found)."""
+        # Stop any 360° scan in progress - we found something!
+        self._is_scanning = False
+        self._frames_since_scan = 0
 
     # ==============================================
     # PHASE 2: Perception-based object detection
@@ -282,8 +332,9 @@ class BehaviorController:
         if world_objects is None:
             return results
 
-        # Use robot's body angle for full sensor cone coverage
-        # (not scan angle - we want to see everything in the cone, not just where scanning)
+        # FOV = body direction. The robot's "eyes" always look where it's facing.
+        # For 360° coverage, the robot must physically rotate its body.
+        # This is how real robots with forward-facing cameras work.
         look_angle = self.robot.angle
 
         for obj in world_objects:
@@ -1017,14 +1068,34 @@ class BehaviorController:
             self.robot.arm.update(dt)
 
     def _execute_patrol(self, dt: float, trash_group: pygame.sprite.Group, obstacles: pygame.sprite.Group):
-        """Patrol: follow waypoints, actively scan and look for trash."""
+        """
+        Patrol: follow waypoints, periodically do 360° scans to look for trash.
+
+        Real robotics approach:
+        1. Robot has forward-facing camera (FOV cone = body direction)
+        2. For 360° coverage, robot must physically rotate
+        3. Periodic 360° scans + scans at each waypoint ensure full coverage
+        4. Any object detected in FOV triggers investigation/pickup
+        """
         # ==============================================
-        # ACTIVE SCANNING - Robot "head" sweeps looking for trash
+        # 360° BODY ROTATION SCANNING
         # ==============================================
-        self._update_scan()  # Update scanning head movement
+        # If currently doing a 360° scan, continue it
+        if self._is_scanning:
+            scan_complete = self._update_360_scan(dt, trash_group)
+            if not scan_complete:
+                return  # Still scanning, don't move
+
+        # Increment scan timer
+        self._frames_since_scan += 1
+
+        # Check if it's time for a periodic 360° scan
+        if self._should_start_scan() and not self.robot.bin_full:
+            self._start_360_scan()
+            return
 
         # ==============================================
-        # PHASE 2: Perception-based object detection
+        # FORWARD DETECTION - Check what's in our FOV as we move
         # ==============================================
         if not self.robot.bin_full:
             # Try perception-based detection first (Phase 2)
@@ -1139,6 +1210,14 @@ class BehaviorController:
         waypoint = self.patrol_waypoints[self.current_waypoint_index]
 
         if self.navigation.is_at_waypoint(self.robot, waypoint):
+            # ==============================================
+            # REACHED WAYPOINT - Do 360° scan before moving on
+            # ==============================================
+            # This ensures we check all directions at each waypoint
+            if self._scan_at_waypoint and not self.robot.bin_full:
+                self._start_360_scan()
+                # Don't advance waypoint yet - scan first, then we'll come back here
+
             # Check if we're completing a full loop (going from last waypoint back to first)
             old_index = self.current_waypoint_index
             self.current_waypoint_index = (self.current_waypoint_index + 1) % len(self.patrol_waypoints)

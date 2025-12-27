@@ -328,7 +328,8 @@ class SensorSystem:
             )
 
         if show_vision:
-            # Draw vision cone at SCAN angle (robot angle + scan offset)
+            # Draw vision cone at body direction (FOV = where robot faces)
+            # Robot must physically rotate to see different directions
             look_angle = robot.angle + scan_angle_offset
 
             cone_surface = pygame.Surface(

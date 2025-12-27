@@ -222,9 +222,9 @@ class Telemetry:
 
         # Draw sensor visualization
         if behavior_controller:
-            # Pass scan angle so vision cone shows where robot is "looking"
-            scan_offset = getattr(behavior_controller, '_scan_angle', 0.0)
-            behavior_controller.sensors.draw_debug(screen, robot, scan_angle_offset=scan_offset)
+            # FOV cone = body direction (no scan offset - robot must rotate to see)
+            # This is realistic: camera faces where body faces
+            behavior_controller.sensors.draw_debug(screen, robot, scan_angle_offset=0.0)
             behavior_controller.draw_debug(screen, self.font)
 
     def export_log(self, filepath: str):
