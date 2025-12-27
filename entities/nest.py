@@ -119,23 +119,25 @@ class Nest(pygame.sprite.Sprite):
 
     def get_waiting_position(self, queue_position: int = 0) -> Tuple[float, float]:
         """
-        Get a waiting position for robots in queue, away from the ramp.
+        Get a waiting position for robots in queue.
+
+        Robots line up BELOW the bin in a neat row, out of the way of
+        robots approaching or leaving the ramp.
 
         Args:
-            queue_position: Position in queue (0 = first waiting, 1 = second, etc.)
+            queue_position: Position in queue (0 = first, 1 = second, etc.)
 
         Returns:
             Position where robot should wait
         """
-        # Wait to the left and below the ramp entry, staggered by queue position
-        base_x = self.ramp_start[0] - 80  # Left of ramp
-        base_y = self.ramp_start[1] + 60  # Below ramp
+        # Line up below the nest, spaced horizontally
+        base_x = self.x - 40  # Start from center-left of nest
+        base_y = self.y + self.height // 2 + 60  # Below the nest
 
-        # Stagger waiting positions so robots don't stack on each other
-        offset_x = (queue_position % 3) * 60  # 3 columns
-        offset_y = (queue_position // 3) * 60  # Multiple rows if needed
+        # Each robot stands 50px apart in a horizontal line
+        offset_x = queue_position * 50
 
-        return (base_x - offset_x, base_y + offset_y)
+        return (base_x - offset_x, base_y)
 
     def is_robot_at_ramp_entry(self, robot_pos: Tuple[float, float], threshold: float = 30) -> bool:
         """Check if robot is at the ramp entry point."""

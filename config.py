@@ -16,9 +16,9 @@ ROBOT_HEIGHT = 40
 ROBOT_SPEED = 2.0
 ROBOT_TURN_SPEED = 3.0
 ROBOT_BIN_CAPACITY = 10
-ROBOT_SENSOR_RANGE = 150
+ROBOT_SENSOR_RANGE = 150  # Detection range - how far the cameras can see
 ROBOT_GRAB_RANGE = 30
-ROBOT_VISION_CONE = 120  # degrees
+ROBOT_VISION_CONE = 120  # degrees - realistic camera FOV
 
 # =============================================================================
 # ARM

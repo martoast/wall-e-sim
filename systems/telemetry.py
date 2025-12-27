@@ -222,7 +222,9 @@ class Telemetry:
 
         # Draw sensor visualization
         if behavior_controller:
-            behavior_controller.sensors.draw_debug(screen, robot)
+            # Pass scan angle so vision cone shows where robot is "looking"
+            scan_offset = getattr(behavior_controller, '_scan_angle', 0.0)
+            behavior_controller.sensors.draw_debug(screen, robot, scan_angle_offset=scan_offset)
             behavior_controller.draw_debug(screen, self.font)
 
     def export_log(self, filepath: str):

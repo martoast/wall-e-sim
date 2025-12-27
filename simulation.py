@@ -326,10 +326,20 @@ class Simulation:
                     if self.game_won and self.restart_button_rect and self.restart_button_rect.collidepoint(mouse_pos):
                         self.reset()
                     elif not self.game_won:
-                        self._spawn_trash_at(mouse_pos)
+                        # Check if clicking on existing trash to remove it
+                        clicked_trash = self._get_trash_at(mouse_pos)
+                        if clicked_trash:
+                            self._remove_trash(clicked_trash)
+                        else:
+                            self._spawn_trash_at(mouse_pos)
                 elif event.button == 3:  # Right click
                     if not self.game_won:
-                        self._spawn_obstacle_at(mouse_pos)
+                        # Check if clicking on existing obstacle to remove it
+                        clicked_obstacle = self._get_obstacle_at(mouse_pos)
+                        if clicked_obstacle:
+                            self._remove_obstacle(clicked_obstacle)
+                        else:
+                            self._spawn_obstacle_at(mouse_pos)
 
     def _spawn_obstacle_at(self, position: tuple):
         """Spawn an obstacle at a specific position."""
@@ -344,6 +354,46 @@ class Simulation:
 
         obstacle = Obstacle(position)
         self.obstacle_group.add(obstacle)
+
+    def _get_trash_at(self, position: tuple):
+        """Get trash at the given position, or None if no trash there."""
+        x, y = position
+        for trash in self.trash_group:
+            if trash.is_picked:
+                continue
+            # Check if click is within trash radius
+            dist_sq = (x - trash.x) ** 2 + (y - trash.y) ** 2
+            if dist_sq <= (trash.size + 10) ** 2:  # +10 for easier clicking
+                return trash
+        return None
+
+    def _remove_trash(self, trash):
+        """Remove a trash item from the simulation."""
+        # Release any claims on this trash
+        if self.coordinator:
+            self.coordinator.release_claim(trash.id)
+        # Clear target from any robot targeting this trash
+        for behavior in self.behavior_controllers:
+            if behavior.target_trash == trash:
+                behavior.target_trash = None
+                behavior.transition_to(behavior.current_state)  # Reset state
+        # Remove from group
+        self.trash_group.remove(trash)
+
+    def _get_obstacle_at(self, position: tuple):
+        """Get obstacle at the given position, or None if no obstacle there."""
+        x, y = position
+        for obstacle in self.obstacle_group:
+            rect = obstacle.get_rect()
+            # Inflate rect slightly for easier clicking
+            click_rect = rect.inflate(10, 10)
+            if click_rect.collidepoint(x, y):
+                return obstacle
+        return None
+
+    def _remove_obstacle(self, obstacle):
+        """Remove an obstacle from the simulation."""
+        self.obstacle_group.remove(obstacle)
 
     def update(self, dt: float):
         """Update simulation state."""

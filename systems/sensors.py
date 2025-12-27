@@ -297,7 +297,8 @@ class SensorSystem:
         screen: pygame.Surface,
         robot: 'Robot',
         show_range: bool = True,
-        show_vision: bool = True
+        show_vision: bool = True,
+        scan_angle_offset: float = 0.0  # Offset for scanning "head"
     ):
         """Draw debug visualization of sensors."""
         robot_pos = (int(robot.position[0]), int(robot.position[1]))
@@ -327,7 +328,9 @@ class SensorSystem:
             )
 
         if show_vision:
-            # Draw vision cone
+            # Draw vision cone at SCAN angle (robot angle + scan offset)
+            look_angle = robot.angle + scan_angle_offset
+
             cone_surface = pygame.Surface(
                 (self.sensor_range * 2, self.sensor_range * 2),
                 pygame.SRCALPHA
@@ -335,11 +338,9 @@ class SensorSystem:
 
             # Vision cone as a pie slice
             half_cone = self.vision_cone / 2
-            start_angle = math.radians(-robot.angle - half_cone)
-            end_angle = math.radians(-robot.angle + half_cone)
 
             points = [(self.sensor_range, self.sensor_range)]
-            for a in range(int(-robot.angle - half_cone), int(-robot.angle + half_cone) + 1, 5):
+            for a in range(int(-look_angle - half_cone), int(-look_angle + half_cone) + 1, 5):
                 rad = math.radians(a)
                 points.append((
                     self.sensor_range + math.cos(rad) * self.sensor_range,

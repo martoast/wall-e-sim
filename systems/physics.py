@@ -57,29 +57,32 @@ class PhysicsSystem:
         """
         Main physics update loop.
 
-        Args:
-            robots: List of robots
-            trash_group: Sprite group of trash
-            obstacles: Sprite group of obstacles
-            nest: The nest (treated as obstacle)
-            dt: Delta time
+        Uses substeps at high speeds to prevent tunneling through objects.
         """
         self.debug_collisions.clear()
 
-        # FIRST: Push robots out of any obstacles they're stuck inside
-        self._push_robots_out_of_obstacles(robots, obstacles, nest)
+        # At high speeds (dt > 1), use substeps to prevent tunneling
+        num_substeps = max(1, int(dt))
+        substep_dt = dt / num_substeps
 
-        # SECOND: Proactively separate any overlapping robots
-        self._separate_all_overlapping_robots(robots)
+        for _ in range(num_substeps):
+            # Push robots out of any obstacles they're stuck inside
+            self._push_robots_out_of_obstacles(robots, obstacles, nest)
 
-        # Process each robot
-        for robot in robots:
-            self._process_robot_physics(robot, robots, trash_group, obstacles, nest, dt)
+            # Separate overlapping robots
+            self._separate_all_overlapping_robots(robots)
 
-        # Process trash physics (apply velocity, friction, collisions)
-        for trash in trash_group:
-            if not trash.is_picked:
-                self._process_trash_physics(trash, trash_group, obstacles, nest, dt)
+            # CRITICAL: Separate robots from trash they're overlapping with
+            self._separate_robots_from_trash(robots, trash_group)
+
+            # Process each robot with swept collision
+            for robot in robots:
+                self._process_robot_physics(robot, robots, trash_group, obstacles, nest, substep_dt)
+
+            # Process trash physics
+            for trash in trash_group:
+                if not trash.is_picked:
+                    self._process_trash_physics(trash, trash_group, obstacles, nest, substep_dt)
 
     def _process_robot_physics(
         self,
@@ -138,25 +141,30 @@ class PhysicsSystem:
                 )
                 blocked = True
 
-        # Check trash collisions - allow approach to target trash
+        # Check trash collisions - SWEPT collision to prevent tunneling
         target_trash_id = self.robot_targets.get(robot.id, None)
         for trash in trash_group:
             if trash.is_picked:
                 continue
 
-            # CRITICAL FIX: Allow robot to approach its target trash!
-            # This is the trash the robot is trying to pick up
+            # Allow robot to approach its target trash for pickup
             if target_trash_id is not None and trash.id == target_trash_id:
-                # Robot is targeting this trash - allow approach for pickup
                 continue
 
-            trash_rect = trash.get_rect()
-            if test_rect.colliderect(trash_rect):
-                # Stop at non-target trash - stuck detection will handle re-pathing
-                new_x, new_y = self._resolve_aabb_collision(
-                    robot.x, robot.y, robot.width, robot.height,
-                    trash_rect, vx * dt, vy * dt
-                )
+            # Use circle collision with robot's effective radius
+            robot_radius = max(robot.width, robot.height) / 2
+            min_dist = robot_radius + trash.size + 2  # +2 buffer
+
+            # Check if movement would cause collision
+            # Use swept circle-circle collision
+            collision_pos = self._swept_circle_collision(
+                robot.x, robot.y, new_x, new_y, robot_radius,
+                trash.x, trash.y, trash.size
+            )
+
+            if collision_pos is not None:
+                # Stop at the collision point
+                new_x, new_y = collision_pos
                 blocked = True
                 self.debug_collisions.append((robot.position, trash.position))
 
@@ -381,6 +389,88 @@ class PhysicsSystem:
 
         return dist_sq < radius * radius
 
+    def _swept_circle_collision(
+        self,
+        start_x: float, start_y: float,
+        end_x: float, end_y: float,
+        moving_radius: float,
+        static_x: float, static_y: float,
+        static_radius: float
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Swept collision between a moving circle and a static circle.
+
+        Checks if a circle moving from (start_x, start_y) to (end_x, end_y)
+        would collide with a static circle at (static_x, static_y).
+
+        Returns:
+            Position just before collision, or None if no collision
+        """
+        # Combined radius (sum of both radii)
+        combined_r = moving_radius + static_radius + 3  # +3 buffer
+
+        # Vector from start to end
+        dx = end_x - start_x
+        dy = end_y - start_y
+        move_dist_sq = dx * dx + dy * dy
+
+        if move_dist_sq < 0.0001:
+            # Not moving, just check current overlap
+            dist_sq = (start_x - static_x) ** 2 + (start_y - static_y) ** 2
+            if dist_sq < combined_r * combined_r:
+                # Already overlapping - push out
+                dist = math.sqrt(dist_sq) if dist_sq > 0 else 1
+                nx = (start_x - static_x) / dist if dist > 0 else 1
+                ny = (start_y - static_y) / dist if dist > 0 else 0
+                return (static_x + nx * combined_r, static_y + ny * combined_r)
+            return None
+
+        # Vector from start to static circle center
+        fx = start_x - static_x
+        fy = start_y - static_y
+
+        # Quadratic equation: at^2 + bt + c = 0
+        # where t is the parameter along the movement vector (0 to 1)
+        a = move_dist_sq
+        b = 2 * (fx * dx + fy * dy)
+        c = (fx * fx + fy * fy) - combined_r * combined_r
+
+        discriminant = b * b - 4 * a * c
+
+        if discriminant < 0:
+            # No collision along this path
+            return None
+
+        # Find the earliest collision time
+        sqrt_disc = math.sqrt(discriminant)
+        t1 = (-b - sqrt_disc) / (2 * a)
+        t2 = (-b + sqrt_disc) / (2 * a)
+
+        # We want the first intersection in range [0, 1]
+        t = None
+        if 0 <= t1 <= 1:
+            t = t1
+        elif 0 <= t2 <= 1:
+            t = t2
+        elif t1 < 0 and t2 > 1:
+            # We're already inside - push out
+            dist = math.sqrt(fx * fx + fy * fy)
+            if dist > 0:
+                nx, ny = fx / dist, fy / dist
+            else:
+                nx, ny = 1, 0
+            return (static_x + nx * combined_r, static_y + ny * combined_r)
+
+        if t is None:
+            return None
+
+        # Back off slightly from collision point
+        safe_t = max(0, t - 0.05)
+        collision_x = start_x + dx * safe_t
+        collision_y = start_y + dy * safe_t
+
+        return (collision_x, collision_y)
+
     def _deflect_around_robot(
         self,
         robot: 'Robot',
@@ -534,6 +624,55 @@ class PhysicsSystem:
 
                     robot1.rect.center = (int(robot1.x), int(robot1.y))
                     robot2.rect.center = (int(robot2.x), int(robot2.y))
+
+    def _separate_robots_from_trash(self, robots: List['Robot'], trash_group: pygame.sprite.Group):
+        """
+        CRITICAL: Ensure robots NEVER overlap with trash.
+
+        This is called every frame and forcibly separates any overlapping pairs.
+        Uses multiple iterations to handle chain reactions.
+        """
+        # Multiple passes to handle chain separations
+        for _ in range(3):
+            for robot in robots:
+                target_trash_id = self.robot_targets.get(robot.id, None)
+
+                for trash in trash_group:
+                    if trash.is_picked:
+                        continue
+
+                    # Skip target trash - robot is supposed to approach it
+                    if target_trash_id is not None and trash.id == target_trash_id:
+                        continue
+
+                    # Check overlap using effective radius
+                    dx = trash.x - robot.x
+                    dy = trash.y - robot.y
+                    dist = math.sqrt(dx * dx + dy * dy)
+
+                    # Minimum distance: robot radius + trash radius + buffer
+                    robot_radius = max(robot.width, robot.height) / 2
+                    min_dist = robot_radius + trash.size + 5
+
+                    if dist < min_dist:
+                        if dist < 0.001:
+                            # Exactly overlapping - push in arbitrary direction
+                            dx, dy, dist = 1.0, 0.0, 1.0
+
+                        # Calculate separation needed
+                        overlap = min_dist - dist
+                        nx = dx / dist
+                        ny = dy / dist
+
+                        # Push FULLY apart - no partial separation
+                        # Robot moves back, trash moves forward
+                        robot.x -= nx * (overlap * 0.4 + 2)
+                        robot.y -= ny * (overlap * 0.4 + 2)
+                        trash.x += nx * (overlap * 0.6 + 2)
+                        trash.y += ny * (overlap * 0.6 + 2)
+
+                        robot.rect.center = (int(robot.x), int(robot.y))
+                        trash.rect.center = (int(trash.x), int(trash.y))
 
     def _separate_robots(self, robot1: 'Robot', robot2: 'Robot'):
         """Push two overlapping robots apart."""

@@ -108,6 +108,19 @@ class BehaviorController:
         self._obstacles: Optional[pygame.sprite.Group] = None
         self._shared_map: Optional['SharedMap'] = None
 
+        # ==============================================
+        # SCANNING SYSTEM - Robot "head" looks around
+        # ==============================================
+        # Like WALL-E's head moving to scan the environment
+        self._scan_angle = 0.0           # Current scan offset from body angle
+        self._scan_target = 0.0          # Target scan offset (smooth interpolation)
+        self._scan_speed = 4.0           # Degrees per frame to turn "head"
+        self._scan_hold_timer = 0        # Frames held at current position
+        self._scan_hold_duration = 25    # Frames to hold at each scan position
+        # Scan pattern: left, center, right, center (smooth sweep)
+        self._scan_positions = [-55, 0, 55, 0]
+        self._scan_index = 0
+
         # Generate initial patrol path
         self._generate_patrol()
 
@@ -136,6 +149,80 @@ class BehaviorController:
         self._wall_follow_direction = None
         self._wall_follow_frames = 0
         self._tried_both_directions = False
+
+    # ==============================================
+    # SCANNING SYSTEM - Active visual search
+    # ==============================================
+
+    def _update_scan(self):
+        """
+        Update the scanning "head" movement.
+
+        The robot's camera/head smoothly sweeps left-center-right-center
+        while patrolling, like WALL-E looking around for interesting things.
+        """
+        # Smoothly move scan angle toward target
+        angle_diff = self._scan_target - self._scan_angle
+        if abs(angle_diff) > self._scan_speed:
+            # Still moving toward target
+            self._scan_angle += self._scan_speed if angle_diff > 0 else -self._scan_speed
+        else:
+            # Reached target - hold position then move to next
+            self._scan_angle = self._scan_target
+            self._scan_hold_timer += 1
+
+            if self._scan_hold_timer >= self._scan_hold_duration:
+                # Move to next scan position
+                self._scan_hold_timer = 0
+                self._scan_index = (self._scan_index + 1) % len(self._scan_positions)
+                self._scan_target = self._scan_positions[self._scan_index]
+
+    def _get_scan_look_angle(self) -> float:
+        """Get the current direction the robot is 'looking' (body angle + scan offset)."""
+        return self.robot.angle + self._scan_angle
+
+    def _scan_for_trash(self, trash_group: pygame.sprite.Group) -> Optional['Trash']:
+        """
+        Scan for trash at the current scan angle.
+
+        Uses the robot's vision cone but oriented at the scan angle,
+        not the body angle. This simulates a camera/head that can
+        turn independently of the body.
+
+        Returns:
+            Nearest visible trash, or None
+        """
+        from utils.math_helpers import point_in_cone
+
+        look_angle = self._get_scan_look_angle()
+        detected = []
+
+        for trash in trash_group:
+            if trash.is_picked:
+                continue
+
+            # Check if trash is in vision cone at SCAN angle (not body angle)
+            if point_in_cone(
+                self.robot.position,
+                look_angle,
+                trash.position,
+                self.sensors.vision_cone,
+                self.sensors.sensor_range
+            ):
+                dist = distance(self.robot.position, trash.position)
+                detected.append((dist, trash))
+
+        # Return nearest
+        if detected:
+            detected.sort(key=lambda x: x[0])
+            return detected[0][1]
+        return None
+
+    def _reset_scan_to_center(self):
+        """Reset scanning to look forward (used when trash found)."""
+        self._scan_target = 0
+        self._scan_index = 1  # Index of center position
+        self._scan_hold_timer = 0
 
     def _get_current_goal(self) -> Optional[Tuple[float, float]]:
         """Get the current goal position based on state."""
@@ -319,10 +406,7 @@ class BehaviorController:
         """
         SURVIVAL INSTINCT: Aggressive escape when truly stuck!
 
-        When wall-following both directions failed, we need drastic action:
-        1. Try SHORT escapes first (easier to find gaps in tight spaces)
-        2. Try MANY directions (not just away from goal)
-        3. Clear all current goals and start fresh
+        Smart about screen edges - prioritizes escaping toward screen center.
         """
         import random
         from config import SCREEN_WIDTH, SCREEN_HEIGHT
@@ -331,17 +415,33 @@ class BehaviorController:
         margin = 60
         treat_trash_as_obstacles = self.robot.bin_full
 
-        # Try multiple distances - START SHORT, then go longer
-        # In tight spaces, a short escape is more likely to find a gap
-        escape_distances = [60, 100, 150, 200, 250]
+        # Calculate direction toward screen center (escape away from edges!)
+        center_x, center_y = SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2
+        to_center_x = center_x - robot_pos[0]
+        to_center_y = center_y - robot_pos[1]
+        to_center_dist = math.sqrt(to_center_x**2 + to_center_y**2)
 
-        # Try MANY angles - 8 directions like a compass rose
-        angles = [i * math.pi / 4 for i in range(8)]  # 0, 45, 90, 135, 180, 225, 270, 315 degrees
-        random.shuffle(angles)  # Randomize order to avoid predictable patterns
+        # Normalize direction to center
+        if to_center_dist > 1:
+            to_center_x /= to_center_dist
+            to_center_y /= to_center_dist
 
-        # First: Try to find ANY clear direction
+        # Calculate angle toward center
+        center_angle = math.atan2(to_center_y, to_center_x)
+
+        # PRIORITY 1: Try escaping toward screen center first (best for edge cases)
+        # Try angles biased toward center: center, center±30°, center±60°, center±90°
+        center_biased_angles = [
+            center_angle,
+            center_angle + math.pi/6, center_angle - math.pi/6,  # ±30°
+            center_angle + math.pi/3, center_angle - math.pi/3,  # ±60°
+            center_angle + math.pi/2, center_angle - math.pi/2,  # ±90°
+        ]
+
+        escape_distances = [60, 100, 150, 200]
+
         for escape_dist in escape_distances:
-            for angle in angles:
+            for angle in center_biased_angles:
                 escape_x = robot_pos[0] + math.cos(angle) * escape_dist
                 escape_y = robot_pos[1] + math.sin(angle) * escape_dist
 
@@ -349,35 +449,64 @@ class BehaviorController:
                 escape_x = max(margin, min(SCREEN_WIDTH - margin, escape_x))
                 escape_y = max(margin, min(SCREEN_HEIGHT - margin, escape_y))
 
+                # Skip if clamping made target too close (we're at an edge)
+                actual_dist = distance(robot_pos, (escape_x, escape_y))
+                if actual_dist < 40:
+                    continue
+
                 escape_target = (escape_x, escape_y)
 
-                # Check if this direction is clear
                 if self._has_line_of_sight(escape_target, account_for_width=True, treat_trash_as_obstacles=treat_trash_as_obstacles):
                     self._wander_target = escape_target
                     self._finalize_escape()
                     return
 
-        # DESPERATE MODE: If no clear path found at all, try WITHOUT width check
-        # (squeeze through tight gaps)
-        for escape_dist in [50, 80, 120]:
-            for angle in angles:
+        # PRIORITY 2: Try all 8 compass directions
+        all_angles = [i * math.pi / 4 for i in range(8)]
+        random.shuffle(all_angles)
+
+        for escape_dist in escape_distances:
+            for angle in all_angles:
                 escape_x = robot_pos[0] + math.cos(angle) * escape_dist
                 escape_y = robot_pos[1] + math.sin(angle) * escape_dist
                 escape_x = max(margin, min(SCREEN_WIDTH - margin, escape_x))
                 escape_y = max(margin, min(SCREEN_HEIGHT - margin, escape_y))
+
+                actual_dist = distance(robot_pos, (escape_x, escape_y))
+                if actual_dist < 40:
+                    continue
+
                 escape_target = (escape_x, escape_y)
 
-                # Try without width buffer - squeeze through!
+                if self._has_line_of_sight(escape_target, account_for_width=True, treat_trash_as_obstacles=treat_trash_as_obstacles):
+                    self._wander_target = escape_target
+                    self._finalize_escape()
+                    return
+
+        # DESPERATE MODE: Squeeze through tight gaps (no width check)
+        for escape_dist in [50, 80, 120]:
+            for angle in center_biased_angles + all_angles:
+                escape_x = robot_pos[0] + math.cos(angle) * escape_dist
+                escape_y = robot_pos[1] + math.sin(angle) * escape_dist
+                escape_x = max(margin, min(SCREEN_WIDTH - margin, escape_x))
+                escape_y = max(margin, min(SCREEN_HEIGHT - margin, escape_y))
+
+                actual_dist = distance(robot_pos, (escape_x, escape_y))
+                if actual_dist < 30:
+                    continue
+
+                escape_target = (escape_x, escape_y)
+
                 if self._has_line_of_sight(escape_target, account_for_width=False, treat_trash_as_obstacles=treat_trash_as_obstacles):
                     self._wander_target = escape_target
                     self._finalize_escape()
                     return
 
-        # LAST RESORT: Just pick a random direction and hope physics helps us
-        angle = random.uniform(0, 2 * math.pi)
+        # LAST RESORT: Head toward screen center no matter what
+        # This at least gets us away from edges
         self._wander_target = (
-            max(margin, min(SCREEN_WIDTH - margin, robot_pos[0] + math.cos(angle) * 100)),
-            max(margin, min(SCREEN_HEIGHT - margin, robot_pos[1] + math.sin(angle) * 100))
+            robot_pos[0] + to_center_x * 150,
+            robot_pos[1] + to_center_y * 150
         )
         self._finalize_escape()
 
@@ -695,7 +824,41 @@ class BehaviorController:
             self.robot.arm.update(dt)
 
     def _execute_patrol(self, dt: float, trash_group: pygame.sprite.Group, obstacles: pygame.sprite.Group):
-        """Patrol: follow waypoints, look for trash."""
+        """Patrol: follow waypoints, actively scan and look for trash."""
+        # ==============================================
+        # ACTIVE SCANNING - Robot "head" sweeps looking for trash
+        # ==============================================
+        self._update_scan()  # Update scanning head movement
+
+        # Check for trash using scanning camera system
+        if not self.robot.bin_full:
+            # Scan for trash at current scan angle
+            spotted_trash = self._scan_for_trash(trash_group)
+
+            if spotted_trash:
+                # Check if claimed by another robot
+                if self._coordinator and self._coordinator.is_claimed_by_other(spotted_trash, self.robot.id):
+                    spotted_trash = None
+
+                # Check line of sight (obstacles blocking)
+                elif not self._has_line_of_sight(spotted_trash.position):
+                    spotted_trash = None
+
+                # Try to claim it
+                elif self._coordinator:
+                    if not self._coordinator.claim_trash(self.robot.id, spotted_trash):
+                        spotted_trash = None
+
+            if spotted_trash:
+                # Found trash! Reset scan and go get it
+                self._reset_scan_to_center()
+                self._frames_since_found_trash = 0
+                self._patrol_loops_without_trash = 0
+                self._wander_target = None  # Cancel wandering
+                self.target_trash = spotted_trash
+                self.transition_to(RobotState.SEEKING)
+                return
+
         # If wandering to a new area
         if self._wander_target:
             dist_to_wander = distance(self.robot.position, self._wander_target)
@@ -715,31 +878,6 @@ class BehaviorController:
         if self._frames_since_found_trash > self.WANDER_THRESHOLD:
             self._pick_wander_target()
             return
-
-        # Look for trash if bin not full
-        if not self.robot.bin_full:
-            visible_trash = self.sensors.detect_trash_in_vision(self.robot, trash_group)
-
-            for trash in visible_trash:
-                # Skip if claimed by another robot
-                if self._coordinator and self._coordinator.is_claimed_by_other(trash, self.robot.id):
-                    continue
-
-                # Check line of sight - can we actually see this trash?
-                if not self._has_line_of_sight(trash.position):
-                    continue
-
-                # Try to claim
-                if self._coordinator:
-                    if not self._coordinator.claim_trash(self.robot.id, trash):
-                        continue
-
-                # Found trash! Reset exploration counters
-                self._frames_since_found_trash = 0
-                self._patrol_loops_without_trash = 0
-                self.target_trash = trash
-                self.transition_to(RobotState.SEEKING)
-                return
 
         # Return to dump if bin full
         if self.robot.bin_full:
@@ -989,12 +1127,25 @@ class BehaviorController:
     def _execute_returning(self, dt: float, obstacles: pygame.sprite.Group):
         """Returning: navigate to nest ramp, going around obstacles if needed."""
         ramp_entry = self.nest.get_ramp_entry()
+        dist_to_ramp = distance(self.robot.position, ramp_entry)
 
-        # Check if we've reached the nest
-        if self.nest.is_robot_at_ramp_entry(self.robot.position):
-            self._return_waypoint = None
-            self._return_stuck_count = 0  # Reset - we made it!
-            self.transition_to(RobotState.DOCKING)
+        # When close to the ramp area, check if we can proceed or need to wait
+        if dist_to_ramp < 80:
+            can_proceed = True
+            if self._coordinator:
+                # Must be at front of queue AND ramp must be clear
+                can_proceed = self._coordinator.can_dump(self.robot.id) and self._coordinator.is_ramp_clear()
+
+            if can_proceed:
+                # We can dock - claim ramp and proceed
+                if self._coordinator:
+                    self._coordinator.claim_ramp(self.robot.id)
+                self._return_waypoint = None
+                self._return_stuck_count = 0
+                self.transition_to(RobotState.DOCKING)
+            else:
+                # Ramp busy or not our turn - go to waiting area
+                self.transition_to(RobotState.WAITING)
             return
 
         # If we have a waypoint to navigate around an obstacle
@@ -1003,109 +1154,183 @@ class BehaviorController:
             if dist_to_waypoint < 30:
                 # Reached the waypoint - this is progress!
                 self._return_waypoint = None
-                self._return_stuck_count = max(0, self._return_stuck_count - 1)  # Reduce stuck count
+                self._return_stuck_count = max(0, self._return_stuck_count - 1)
                 self._reset_progress_tracking()
             else:
-                # Move toward the waypoint
                 self._move_toward(self._return_waypoint, dt)
                 return
 
-        # Move toward nest
+        # Check if direct path to nest is blocked
+        if not self._has_line_of_sight(ramp_entry, account_for_width=True, treat_trash_as_obstacles=True):
+            waypoint = self._find_return_waypoint(ramp_entry)
+            if waypoint:
+                self._return_waypoint = waypoint
+                self._move_toward(self._return_waypoint, dt)
+                return
+
+        # Direct path is clear - move toward nest
         self._move_toward(ramp_entry, dt)
 
+    def _find_return_waypoint(self, target: Tuple[float, float]) -> Optional[Tuple[float, float]]:
+        """
+        Find a waypoint to navigate around obstacles when returning to nest.
+
+        Tries perpendicular offsets from the direct path to find a clear route.
+        """
+        robot_pos = self.robot.position
+
+        # Direction to target
+        dx = target[0] - robot_pos[0]
+        dy = target[1] - robot_pos[1]
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        if dist < 50:
+            return None  # Close enough, just go direct
+
+        # Normalize
+        dx /= dist
+        dy /= dist
+
+        # Perpendicular directions
+        perp_left = (-dy, dx)
+        perp_right = (dy, -dx)
+
+        # Try waypoints at various perpendicular offsets
+        # Start closer, then try farther
+        offsets = [80, 120, 160, 200]
+
+        # Try waypoints at 1/3 and 2/3 of the way to target
+        for path_fraction in [0.33, 0.5, 0.66]:
+            mid_x = robot_pos[0] + dx * dist * path_fraction
+            mid_y = robot_pos[1] + dy * dist * path_fraction
+
+            for offset in offsets:
+                for perp in [perp_left, perp_right]:
+                    waypoint = (
+                        mid_x + perp[0] * offset,
+                        mid_y + perp[1] * offset
+                    )
+
+                    # Check if waypoint is in bounds
+                    from config import SCREEN_WIDTH, SCREEN_HEIGHT
+                    margin = 60
+                    if not (margin < waypoint[0] < SCREEN_WIDTH - margin and
+                            margin < waypoint[1] < SCREEN_HEIGHT - margin):
+                        continue
+
+                    # Check if we can reach the waypoint AND waypoint can reach target
+                    if (self._has_line_of_sight(waypoint, account_for_width=True, treat_trash_as_obstacles=True) and
+                        self._has_line_of_sight_from(waypoint, target, treat_trash_as_obstacles=True)):
+                        return waypoint
+
+        return None
+
+    def _has_line_of_sight_from(self, start: Tuple[float, float], target: Tuple[float, float], treat_trash_as_obstacles: bool = False) -> bool:
+        """Check line of sight from an arbitrary point (not robot position)."""
+        if self._obstacles is None:
+            return True
+
+        inflate_amount = int(self.robot.width * 0.6)
+
+        for obstacle in self._obstacles:
+            rect = obstacle.get_rect()
+            inflated_rect = rect.inflate(inflate_amount, inflate_amount)
+            if self._line_intersects_rect(start, target, inflated_rect):
+                return False
+
+        # Check nest
+        nest_rect = self.nest.get_rect()
+        inflated_nest = nest_rect.inflate(inflate_amount, inflate_amount)
+        if self._line_intersects_rect(start, target, inflated_nest):
+            return False
+
+        # Check trash if needed
+        if treat_trash_as_obstacles and self._trash_group:
+            for trash in self._trash_group:
+                if trash.is_picked:
+                    continue
+                trash_rect = pygame.Rect(
+                    trash.x - trash.size - 10,
+                    trash.y - trash.size - 10,
+                    (trash.size + 10) * 2,
+                    (trash.size + 10) * 2
+                )
+                if self._line_intersects_rect(start, target, trash_rect):
+                    return False
+
+        return True
+
     def _execute_waiting(self, dt: float, obstacles: pygame.sprite.Group):
-        """Waiting: move to waiting area and wait for turn to dump."""
-        if self._coordinator and self._coordinator.can_dump(self.robot.id):
-            self.transition_to(RobotState.RETURNING)
-            return
-
-        # Get our position in queue and move to designated waiting spot
-        queue_pos = 0
+        """Waiting: stay where you are until it's your turn to dump."""
+        # Check if it's our turn AND ramp is clear
         if self._coordinator:
-            queue_pos = max(0, self._coordinator.get_queue_position(self.robot.id) - 1)  # -1 because first in queue is dumping
+            if self._coordinator.can_dump(self.robot.id) and self._coordinator.is_ramp_clear():
+                # Our turn! Go to ramp
+                self.transition_to(RobotState.RETURNING)
+                return
 
-        waiting_pos = self.nest.get_waiting_position(queue_pos)
-        dist_to_waiting = distance(self.robot.position, waiting_pos)
-
-        if dist_to_waiting > 30:
-            # Move to waiting position
-            self._move_toward(waiting_pos, dt)
-        else:
-            # At waiting position, just stop
-            self.robot.set_velocity(0, 0)
+        # Just stop and wait - don't go anywhere
+        self.robot.set_velocity(0, 0)
 
     def _execute_docking(self, dt: float):
-        """Docking: climb up the ramp (with exclusive ramp access)."""
+        """Docking: climb up the ramp (we already have exclusive ramp access)."""
         dock_pos = self.nest.get_dock_position()
 
         # Check if we're docked
         if self.nest.is_robot_docked(self.robot.position):
+            self.robot.set_velocity(0, 0)
             self.transition_to(RobotState.DUMPING)
             return
 
-        # Try to claim the ramp before entering
-        if self._coordinator:
-            if not self._coordinator.claim_ramp(self.robot.id):
-                # Ramp is occupied by another robot - wait at entry
-                ramp_entry = self.nest.get_ramp_entry()
-                dist_to_entry = distance(self.robot.position, ramp_entry)
-                if dist_to_entry > 40:
-                    # Back off slightly from ramp
-                    self.robot.move_toward(ramp_entry, dt * 0.3)
-                else:
-                    # Stop and wait
-                    self.robot.set_velocity(0, 0)
-                return
-
-        # We have the ramp - move up
-        self.robot.move_toward(dock_pos, dt)
+        # Climb up the ramp at steady speed
+        self.robot.move_toward(dock_pos, dt * 0.7)
 
     def _execute_dumping(self, dt: float):
         """Dumping: empty bin into nest."""
         self.dump_timer += dt
+        self.robot.set_velocity(0, 0)
 
-        # Wait for dump animation
-        if self.dump_timer < 30:
-            return
-
-        # Dump trash
-        if not self.robot.bin_empty:
+        # Wait a moment, then dump
+        if self.dump_timer > 15 and not self.robot.bin_empty:
             dumped = self.robot.empty_bin()
             self.nest.receive_trash(dumped)
             if self._telemetry and dumped > 0:
                 self._telemetry.log(EventType.TRASH_DUMP, self.robot.id, {'count': dumped})
 
-        # After dump animation, drive back down
-        if self.dump_timer > 60:
+        # After dumping, wait a bit then undock
+        if self.dump_timer > 40:
             if self._coordinator:
                 self._coordinator.finish_dump(self.robot.id)
             self.transition_to(RobotState.UNDOCKING)
 
     def _execute_undocking(self, dt: float):
-        """Undocking: drive back down the ramp smoothly, releasing ramp when clear."""
+        """Undocking: back down the ramp and get out of the way."""
         ramp_entry = self.nest.get_ramp_entry()
 
-        # Check if we've reached the bottom of the ramp
-        dist = distance(self.robot.position, ramp_entry)
+        # Phase 1: Back down past ramp entry and release it
+        if self._coordinator and self._coordinator.get_ramp_owner() == self.robot.id:
+            clear_pos = (ramp_entry[0] - 50, ramp_entry[1])
+            dist_to_clear = distance(self.robot.position, clear_pos)
 
-        # Release ramp when we're far enough from the dock position (fully off the ramp)
-        # This ensures the next robot won't collide with us on the ramp
-        dock_pos = self.nest.get_dock_position()
-        dist_from_dock = distance(self.robot.position, dock_pos)
-        if dist_from_dock > 80 and self._coordinator:
-            # We're clear of the ramp - release it for next robot
-            self._coordinator.release_ramp(self.robot.id)
-
-        if dist < 20:
-            # Done undocking - ensure ramp is released and start patrol
-            if self._coordinator:
+            if dist_to_clear < 25:
+                # Clear of ramp - release it
                 self._coordinator.release_ramp(self.robot.id)
+            else:
+                self.robot.move_toward(clear_pos, dt * 0.8)
+                return
+
+        # Phase 2: Move to departure zone (above the nest, out of the way)
+        # This ensures we don't block robots approaching from the waiting area
+        departure_pos = (self.nest.x - 100, self.nest.y - self.nest.height // 2 - 60)
+        dist_to_departure = distance(self.robot.position, departure_pos)
+
+        if dist_to_departure < 40:
+            # Far enough away - now patrol
             self._generate_patrol()
             self.transition_to(RobotState.PATROL)
             return
 
-        # Drive down the ramp
-        self.robot.move_toward(ramp_entry, dt)
+        self.robot.move_toward(departure_pos, dt * 0.9)
 
     def _get_robot_repulsion_vector(self) -> Tuple[float, float]:
         """
