@@ -208,18 +208,49 @@ class BehaviorController:
 
     def _handle_stuck(self):
         """
-        Handle being stuck - simple ant-like wall-following.
+        Handle being stuck - SURVIVAL INSTINCTS!
 
-        ANT RULES:
-        1. When stuck, start following the wall (turn 90°)
-        2. Keep checking if direct path to goal is clear
-        3. If wall-following fails, try the other direction
-        4. If both fail, skip current goal and move on
+        SMART RULES:
+        1. First check: Is trash blocking us? If bin not full, GRAB IT!
+        2. If not, try wall-following (turn 90°)
+        3. Keep checking if direct path to goal is clear
+        4. If wall-following fails, try the other direction
+        5. If both fail, AGGRESSIVE ESCAPE: back up and flee!
         """
         # Reset stuck counter
         self._stuck_frames = 0
         self._position_history.clear()
 
+        # ==============================================
+        # SURVIVAL INSTINCT #1: Opportunistic trash grab
+        # ==============================================
+        # If we're stuck and there's trash nearby, just grab it!
+        # It's probably what's blocking us anyway.
+        if not self.robot.bin_full and self._trash_group:
+            nearby_trash = self._find_nearby_trash_to_grab()
+            if nearby_trash:
+                # Switch to grabbing this trash!
+                if self._coordinator:
+                    # Release old claim if any
+                    if self.target_trash:
+                        self._coordinator.release_claim(self.target_trash.id)
+                    # Claim new trash
+                    if self._coordinator.claim_trash(self.robot.id, nearby_trash):
+                        self.target_trash = nearby_trash
+                        self._wall_follow_direction = None
+                        self._wall_follow_frames = 0
+                        self._tried_both_directions = False
+                        self.transition_to(RobotState.SEEKING)
+                        return
+                else:
+                    self.target_trash = nearby_trash
+                    self._wall_follow_direction = None
+                    self.transition_to(RobotState.SEEKING)
+                    return
+
+        # ==============================================
+        # Wall-following mode
+        # ==============================================
         # If not already wall-following, start
         if self._wall_follow_direction is None:
             # Pick initial direction (prefer left, like many ant species)
@@ -240,43 +271,140 @@ class BehaviorController:
                 self._tried_both_directions = True
                 return
             else:
-                # Both directions failed - give up on current goal
+                # ==============================================
+                # SURVIVAL INSTINCT #2: AGGRESSIVE ESCAPE!
+                # ==============================================
+                # Both directions failed - time for drastic action!
                 self._wall_follow_direction = None
                 self._wall_follow_frames = 0
                 self._tried_both_directions = False
-                self._skip_current_goal()
+                self._aggressive_escape()
                 return
 
-    def _skip_current_goal(self):
+    def _find_nearby_trash_to_grab(self) -> Optional['Trash']:
         """
-        Skip the current goal - we're truly stuck (both wall-follow directions failed).
+        Find trash very close to the robot that might be blocking us.
 
-        Don't just try the next waypoint - GET OUT of this stuck area first!
+        When stuck, check if there's grabbable trash nearby - it's probably
+        what's blocking us! Grab it to clear our path.
         """
-        # If targeting trash, give up on it
+        if not self._trash_group:
+            return None
+
+        robot_pos = self.robot.position
+
+        # Look for trash within grabbing range (closer than normal detection)
+        GRAB_RANGE = 80  # Close enough to grab
+
+        best_trash = None
+        best_dist = GRAB_RANGE
+
+        for trash in self._trash_group:
+            if trash.is_picked:
+                continue
+
+            # Skip if claimed by another robot
+            if self._coordinator and self._coordinator.is_claimed_by_other(trash, self.robot.id):
+                continue
+
+            trash_dist = distance(robot_pos, trash.position)
+
+            if trash_dist < best_dist:
+                best_trash = trash
+                best_dist = trash_dist
+
+        return best_trash
+
+    def _aggressive_escape(self):
+        """
+        SURVIVAL INSTINCT: Aggressive escape when truly stuck!
+
+        When wall-following both directions failed, we need drastic action:
+        1. Try SHORT escapes first (easier to find gaps in tight spaces)
+        2. Try MANY directions (not just away from goal)
+        3. Clear all current goals and start fresh
+        """
+        import random
+        from config import SCREEN_WIDTH, SCREEN_HEIGHT
+
+        robot_pos = self.robot.position
+        margin = 60
+        treat_trash_as_obstacles = self.robot.bin_full
+
+        # Try multiple distances - START SHORT, then go longer
+        # In tight spaces, a short escape is more likely to find a gap
+        escape_distances = [60, 100, 150, 200, 250]
+
+        # Try MANY angles - 8 directions like a compass rose
+        angles = [i * math.pi / 4 for i in range(8)]  # 0, 45, 90, 135, 180, 225, 270, 315 degrees
+        random.shuffle(angles)  # Randomize order to avoid predictable patterns
+
+        # First: Try to find ANY clear direction
+        for escape_dist in escape_distances:
+            for angle in angles:
+                escape_x = robot_pos[0] + math.cos(angle) * escape_dist
+                escape_y = robot_pos[1] + math.sin(angle) * escape_dist
+
+                # Clamp to screen bounds
+                escape_x = max(margin, min(SCREEN_WIDTH - margin, escape_x))
+                escape_y = max(margin, min(SCREEN_HEIGHT - margin, escape_y))
+
+                escape_target = (escape_x, escape_y)
+
+                # Check if this direction is clear
+                if self._has_line_of_sight(escape_target, account_for_width=True, treat_trash_as_obstacles=treat_trash_as_obstacles):
+                    self._wander_target = escape_target
+                    self._finalize_escape()
+                    return
+
+        # DESPERATE MODE: If no clear path found at all, try WITHOUT width check
+        # (squeeze through tight gaps)
+        for escape_dist in [50, 80, 120]:
+            for angle in angles:
+                escape_x = robot_pos[0] + math.cos(angle) * escape_dist
+                escape_y = robot_pos[1] + math.sin(angle) * escape_dist
+                escape_x = max(margin, min(SCREEN_WIDTH - margin, escape_x))
+                escape_y = max(margin, min(SCREEN_HEIGHT - margin, escape_y))
+                escape_target = (escape_x, escape_y)
+
+                # Try without width buffer - squeeze through!
+                if self._has_line_of_sight(escape_target, account_for_width=False, treat_trash_as_obstacles=treat_trash_as_obstacles):
+                    self._wander_target = escape_target
+                    self._finalize_escape()
+                    return
+
+        # LAST RESORT: Just pick a random direction and hope physics helps us
+        angle = random.uniform(0, 2 * math.pi)
+        self._wander_target = (
+            max(margin, min(SCREEN_WIDTH - margin, robot_pos[0] + math.cos(angle) * 100)),
+            max(margin, min(SCREEN_HEIGHT - margin, robot_pos[1] + math.sin(angle) * 100))
+        )
+        self._finalize_escape()
+
+    def _finalize_escape(self):
+        """Common cleanup after setting escape target."""
+
+        # Clear current goals - fresh start!
         if self.target_trash:
             if self._coordinator:
                 self._coordinator.release_claim(self.target_trash.id)
             self.target_trash = None
-            self.transition_to(RobotState.PATROL)
-            return
 
-        # If on patrol and truly stuck, don't just try next waypoint -
-        # ESCAPE to a completely different area first!
-        if self.current_state == RobotState.PATROL:
-            # Pick a wander target to escape this stuck region
-            self._pick_wander_target()
-            # Clear current patrol - will generate new one after reaching wander target
-            self.patrol_waypoints = []
-            return
+        self.patrol_waypoints = []
+        self._return_waypoint = None
 
-        # If returning to nest, try a different approach angle
-        if self.current_state == RobotState.RETURNING:
+        # If we were returning to dump, we'll try again after escaping
+        if self.current_state in [RobotState.RETURNING, RobotState.WAITING]:
             self._return_stuck_count += 1
-            if self._return_stuck_count >= 3:
-                # Really stuck - go somewhere else and try again
-                self._pick_wander_target()
-                self._return_stuck_count = 0
+
+        # Transition to patrol (will follow wander_target first)
+        self.transition_to(RobotState.PATROL)
+
+    def _skip_current_goal(self):
+        """
+        Skip the current goal - legacy method, now uses aggressive escape.
+        """
+        self._aggressive_escape()
 
     def _is_path_to_goal_clear(self, goal: Tuple[float, float]) -> bool:
         """Check if direct path to goal is now clear (for exiting wall-follow mode)."""
@@ -336,12 +464,16 @@ class BehaviorController:
         Pick a location to wander to - prioritize directions with clear line of sight!
 
         When stuck, we need to go somewhere we can ACTUALLY reach.
+        When bin is full, treat trash as obstacles (we can't pick them up anyway).
         """
         import random
         from config import SCREEN_WIDTH, SCREEN_HEIGHT
 
         robot_pos = self.robot.position
         margin = 80
+
+        # When bin is full, trash blocks us too!
+        treat_trash_as_obstacles = self.robot.bin_full
 
         # FIRST: Try to find a target we have clear line of sight to
         # This ensures we can actually GET there
@@ -362,7 +494,7 @@ class BehaviorController:
                 continue
 
             # KEY: Check if we have clear line of sight to this target!
-            if self._has_line_of_sight(target, account_for_width=True):
+            if self._has_line_of_sight(target, account_for_width=True, treat_trash_as_obstacles=treat_trash_as_obstacles):
                 self._wander_target = target
                 return
 
@@ -380,7 +512,7 @@ class BehaviorController:
                 if not self.navigation.is_in_bounds(target):
                     continue
 
-                if self._has_line_of_sight(target, account_for_width=True):
+                if self._has_line_of_sight(target, account_for_width=True, treat_trash_as_obstacles=treat_trash_as_obstacles):
                     self._wander_target = target
                     return
 

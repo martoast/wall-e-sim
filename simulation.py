@@ -204,10 +204,11 @@ class Simulation:
                         too_close = True
                         break
 
-                # Avoid spawning on robots
+                # Avoid spawning on robots (use larger buffer to account for robot size + trash size)
                 if not too_close:
                     for robot in self.robots:
-                        if abs(x - robot.x) < 60 and abs(y - robot.y) < 60:
+                        # Robot is ~50px wide, trash is ~15px, add margin = 80px minimum
+                        if abs(x - robot.x) < 80 and abs(y - robot.y) < 80:
                             too_close = True
                             break
 
@@ -220,6 +221,13 @@ class Simulation:
 
     def _spawn_trash_at(self, position: tuple):
         """Spawn a single trash item at a specific position."""
+        x, y = position
+
+        # Don't spawn on robots
+        for robot in self.robots:
+            if abs(x - robot.x) < 80 and abs(y - robot.y) < 80:
+                return  # Skip - too close to robot
+
         trash = Trash(position, trash_type='general')
         self.trash_group.add(trash)
 
