@@ -1396,6 +1396,13 @@ class BehaviorController:
         target_angle = angle_to(self.robot.position, trash_pos)
         self.robot.rotate_toward(target_angle, picking_dt)
 
+        # Get trash size for distance adjustments - tiny trash needs closer approach
+        trash_size = getattr(self.target_trash, 'size', 15)
+        # For tiny trash (< 10px), reduce all distance thresholds
+        # This makes robot get closer before stopping
+        size_factor = min(1.0, trash_size / 15.0)  # 1.0 for normal, smaller for tiny
+        dist_adjust = 50 * (1 - size_factor)  # Up to 50px adjustment for tiny
+
         if self.robot.arm:
             # Check if we succeeded on a previous frame
             if self.robot.arm.state == ArmState.HOLDING:
@@ -1427,13 +1434,18 @@ class BehaviorController:
 
             # AGGRESSIVE SELF-CORRECTION: If we can't reach, move closer!
             # Use capped picking_dt to prevent overshooting at high speeds
-            if dist > 50:
+            # Adjusted thresholds: tiny trash (size < 10) gets closer approach
+            threshold_far = 50 - dist_adjust * 0.5     # 50 for normal, ~35 for tiny
+            threshold_mid = 35 - dist_adjust * 0.3    # 35 for normal, ~20 for tiny
+            threshold_close = 25 - dist_adjust * 0.4  # 25 for normal, ~5 for tiny
+
+            if dist > threshold_far:
                 # Move toward trash at moderate speed
                 self.robot.move_toward(trash_pos, picking_dt)
-            elif dist > 35 and self.robot.arm.extension >= 0.6:
+            elif dist > threshold_mid and self.robot.arm.extension >= 0.6:
                 # Creep forward when moderately close
                 self.robot.move_toward(trash_pos, picking_dt * 0.5)
-            elif dist > 25 and self.robot.arm.extension >= 0.9:
+            elif dist > threshold_close and self.robot.arm.extension >= 0.9:
                 # Final approach - very slow
                 self.robot.move_toward(trash_pos, picking_dt * 0.3)
 

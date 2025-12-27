@@ -195,8 +195,9 @@ class PerceptionSystem:
             return None
 
         # Check if object is too small to perceive at this distance
-        # Reduced penalty (0.005) to allow tiny trash detection at reasonable distances
-        effective_size = obj.features.size - (distance * 0.005)
+        # Very small penalty (0.003) to allow tiny trash detection at max sensor range
+        # At 150px range, a 3px object becomes 2.55px effective - still visible
+        effective_size = obj.features.size - (distance * 0.003)
         if effective_size < self.params.min_perceivable_size:
             return None
 

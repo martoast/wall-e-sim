@@ -165,6 +165,7 @@ class Arm:
         2. Near the elbow joint
         3. Along the arm segment
         4. Near the robot front (for trash that slipped under)
+        5. Near the robot center (for tiny trash right under the robot)
         """
         if self.holding is not None:
             return False
@@ -188,12 +189,20 @@ class Arm:
         )
         mid_dist = distance(mid_seg2, trash.position)
 
-        # Find the minimum distance from any arm part
-        min_dist = min(claw_dist, joint_dist, mid_dist, mount_dist)
+        # Check robot center and front for tiny trash that slipped under
+        robot_center_dist = distance(self.robot.position, trash.position)
+        front_pos = self.robot.get_front_position()
+        front_dist = distance(front_pos, trash.position)
+
+        # Find the minimum distance from any pickup zone
+        min_dist = min(claw_dist, joint_dist, mid_dist, mount_dist, robot_center_dist, front_dist)
 
         # VERY generous pickup range - prioritize success over precision
-        # This ensures the robot can actually grab trash reliably
-        pickup_range = CLAW_SIZE + trash.size + 40  # Increased from 30
+        # Extra generous for tiny objects (< 10 pixels) to ensure they can be grabbed
+        trash_size = getattr(trash, 'size', 10)
+        base_range = 45  # Base pickup range
+        size_bonus = max(0, 15 - trash_size)  # Smaller objects get bigger pickup range bonus
+        pickup_range = CLAW_SIZE + trash_size + base_range + size_bonus
 
         if min_dist <= pickup_range:
             if trash.pick_up(self.robot):
