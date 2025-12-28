@@ -258,11 +258,13 @@ class Simulation:
                         attempts += 1
                         continue
 
-                    # Avoid spawning on obstacles
+                    # Avoid spawning on obstacles (use proper rect collision)
                     too_close = False
                     for obstacle in self.obstacle_group:
-                        ox, oy = obstacle.position
-                        if abs(x - ox) < 50 and abs(y - oy) < 50:
+                        obs_rect = obstacle.get_rect()
+                        # Inflate rect to add buffer around obstacle
+                        buffer = 25
+                        if obs_rect.inflate(buffer * 2, buffer * 2).collidepoint(x, y):
                             too_close = True
                             break
 
@@ -296,6 +298,14 @@ class Simulation:
         for robot in self.robots:
             if abs(x - robot.x) < 80 and abs(y - robot.y) < 80:
                 return  # Skip - too close to robot
+
+        # Don't spawn on or near obstacles
+        for obstacle in self.obstacle_group:
+            obs_rect = obstacle.get_rect()
+            # Inflate rect to add buffer around obstacle
+            buffer = 25
+            if obs_rect.inflate(buffer * 2, buffer * 2).collidepoint(x, y):
+                return  # Skip - on or too close to obstacle
 
         # Don't spawn on or near the nest
         nest_buffer = 80  # Buffer around nest
