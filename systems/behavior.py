@@ -160,6 +160,11 @@ class BehaviorController:
         self._navigation_waypoint: Optional[Tuple[float, float]] = None
         self._bulldoze_mode: bool = False  # Push through trash when stuck
 
+        # APPROACHING state stuck tracking
+        self._approach_stuck_count = 0
+        self._last_approach_dist = 0.0
+        self._approach_no_progress_frames = 0
+
         # References (set during update)
         self._coordinator: Optional['Coordinator'] = None
         self._telemetry: Optional['Telemetry'] = None
@@ -1741,11 +1746,16 @@ class BehaviorController:
             angle_diff = 360 - angle_diff
 
         if angle_diff < 15:
+            # Reset approach tracking for new target
+            self._approach_stuck_count = 0
+            self._approach_no_progress_frames = 0
+            self._last_approach_dist = distance(self.robot.position, self.target_trash.position)
             self.transition_to(RobotState.APPROACHING)
 
     def _execute_approaching(self, dt: float, obstacles: pygame.sprite.Group):
         """Approaching: move toward target trash while facing it."""
         if not self.target_trash or self.target_trash.is_picked:
+            self._approach_stuck_count = 0
             self.transition_to(RobotState.PATROL)
             return
 
@@ -1757,6 +1767,10 @@ class BehaviorController:
                 self._coordinator.release_claim(self.target_trash.id)
                 if self._coordinator.claim_trash(self.robot.id, closer_trash):
                     self.target_trash = closer_trash
+                    # Reset all approach tracking for new target
+                    self._approach_stuck_count = 0
+                    self._approach_no_progress_frames = 0
+                    self._last_approach_dist = distance(self.robot.position, closer_trash.position)
 
         trash_pos = self.target_trash.position
         dist = distance(self.robot.position, trash_pos)
@@ -1771,8 +1785,45 @@ class BehaviorController:
         # Transition to PICKING when close enough
         # Arm reach is ~75px total, but we want to start picking when reasonably close
         if dist < 80 and facing_trash:
+            self._approach_stuck_count = 0
             self.transition_to(RobotState.PICKING)
             return
+
+        # Track if we're making progress toward the trash
+        if dist >= self._last_approach_dist - 2:  # Not making progress
+            self._approach_no_progress_frames += 1
+        else:
+            self._approach_no_progress_frames = 0
+        self._last_approach_dist = dist
+
+        # If stuck for too long trying to reach this trash, give up
+        if self._approach_no_progress_frames > 90:  # ~3 seconds
+            self._approach_stuck_count += 1
+
+            if self._approach_stuck_count >= 3:
+                # Give up on this trash - it's unreachable
+                if self._coordinator:
+                    self._coordinator.release_claim(self.target_trash.id)
+                # Mark as temporarily unreachable (add to objects_decided to skip it)
+                if self._target_classification:
+                    self.scoring.record_ignore(
+                        self.target_trash,
+                        self._target_classification,
+                        self.robot.id,
+                        dist,
+                        investigated=False
+                    )
+                self.target_trash = None
+                self._approach_stuck_count = 0
+                self._approach_no_progress_frames = 0
+                self.transition_to(RobotState.PATROL)
+                return
+
+            # Try backing up and finding a new path
+            self._approach_no_progress_frames = 0
+            backup_pos = self._backup_from_obstacle(trash_pos)
+            if backup_pos:
+                self._navigation_waypoint = backup_pos
 
         # Use SMART NAVIGATION to move toward trash
         # This handles obstacles intelligently instead of just bumping into them
