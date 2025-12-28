@@ -165,6 +165,15 @@ class BehaviorController:
         self._last_approach_dist = 0.0
         self._approach_no_progress_frames = 0
 
+        # Smart navigation progress tracking - detect stuck in tight gaps
+        self._smart_nav_last_dist = 0.0
+        self._smart_nav_no_progress_frames = 0
+        self._smart_nav_failed_waypoints: List[Tuple[float, float]] = []  # Recently failed waypoints
+
+        # State timeout tracking - give up if stuck in a state too long
+        self._state_frames = 0  # Frames in current state
+        self._state_timeout_frames = 300  # ~10 seconds max in INVESTIGATING/APPROACHING
+
         # References (set during update)
         self._coordinator: Optional['Coordinator'] = None
         self._telemetry: Optional['Telemetry'] = None
@@ -217,6 +226,9 @@ class BehaviorController:
         self._wall_follow_direction = None
         self._wall_follow_frames = 0
         self._tried_both_directions = False
+        self._state_frames = 0  # Reset state timeout counter
+        self._smart_nav_no_progress_frames = 0
+        self._smart_nav_failed_waypoints = []
 
     # ==============================================
     # 360° BODY ROTATION SCANNING - Real robotics approach
@@ -980,6 +992,15 @@ class BehaviorController:
 
                     waypoint = (wx, wy)
 
+                    # Skip if this waypoint recently failed (too close to a failed one)
+                    too_close_to_failed = False
+                    for failed_wp in self._smart_nav_failed_waypoints:
+                        if distance(waypoint, failed_wp) < 40:
+                            too_close_to_failed = True
+                            break
+                    if too_close_to_failed:
+                        continue
+
                     # Skip if we can't reach this waypoint
                     # CRITICAL: account_for_width=True ensures robot body can fit!
                     if not self._has_line_of_sight(
@@ -1120,6 +1141,15 @@ class BehaviorController:
                 if distance(robot_pos, backup_pos) < 30:
                     continue
 
+                # Skip if this position recently failed
+                too_close_to_failed = False
+                for failed_wp in self._smart_nav_failed_waypoints:
+                    if distance(backup_pos, failed_wp) < 40:
+                        too_close_to_failed = True
+                        break
+                if too_close_to_failed:
+                    continue
+
                 # CRITICAL: account_for_width=True ensures robot body can fit!
                 if self._has_line_of_sight(
                     backup_pos,
@@ -1208,11 +1238,57 @@ class BehaviorController:
         if treat_trash_as_obstacles is None:
             treat_trash_as_obstacles = self.robot.bin_full
 
+        # =====================================================================
+        # PROGRESS TRACKING: Detect when stuck in tight gaps
+        # If not making progress toward target, try a different route
+        # =====================================================================
+        dist_to_target = distance(robot_pos, target)
+        if dist_to_target >= self._smart_nav_last_dist - 2:  # Not getting closer
+            self._smart_nav_no_progress_frames += 1
+        else:
+            self._smart_nav_no_progress_frames = 0
+            # Clear failed waypoints when making progress
+            if len(self._smart_nav_failed_waypoints) > 0:
+                self._smart_nav_failed_waypoints = []
+        self._smart_nav_last_dist = dist_to_target
+
+        # If stuck for too long, invalidate current waypoint and try another route
+        if self._smart_nav_no_progress_frames > 45:  # ~1.5 seconds without progress
+            if self._navigation_waypoint:
+                # Mark this waypoint as failed so we don't try it again
+                self._smart_nav_failed_waypoints.append(self._navigation_waypoint)
+                # Keep only last 5 failed waypoints
+                if len(self._smart_nav_failed_waypoints) > 5:
+                    self._smart_nav_failed_waypoints.pop(0)
+                self._navigation_waypoint = None
+            # Also reset wall-follow to try a different direction
+            if self._wall_follow_direction:
+                self._wall_follow_direction = 'right' if self._wall_follow_direction == 'left' else 'left'
+                self._wall_follow_frames = 0
+            self._smart_nav_no_progress_frames = 0
+
+        # =====================================================================
+        # WALL-FOLLOW COMMITMENT: If we're in wall-follow mode, stick with it!
+        # This prevents oscillation when path keeps flickering clear/blocked.
+        # =====================================================================
+        min_wall_follow_commitment = 30  # ~1 second minimum commitment
+        if self._wall_follow_direction and self._wall_follow_frames < min_wall_follow_commitment:
+            # Continue wall-following - skip pathfinding, go straight to wall-follow
+            self._wall_follow_frames += 1
+            wall_vec = self._get_wall_follow_direction_vector(target)
+            if wall_vec[0] != 0 or wall_vec[1] != 0:
+                self.robot.set_velocity(wall_vec[0], wall_vec[1])
+                target_angle = math.degrees(math.atan2(wall_vec[1], wall_vec[0]))
+                self.robot.rotate_toward(target_angle, dt)
+            return False
+
         # Check if direct path is clear
         if self._has_line_of_sight(target, treat_trash_as_obstacles=treat_trash_as_obstacles):
             # Clear path - go directly
             self._navigation_waypoint = None
             self._bulldoze_mode = False
+            self._wall_follow_direction = None  # Clear wall-follow state
+            self._wall_follow_frames = 0
             self._move_toward(target, dt)
             return True
 
@@ -1241,6 +1317,8 @@ class BehaviorController:
             backup_pos = self._backup_from_obstacle(target)
             if backup_pos:
                 self._navigation_waypoint = backup_pos
+                self._wall_follow_direction = None  # Clear wall-follow when we find a path
+                self._wall_follow_frames = 0
                 self._move_toward(backup_pos, dt)
                 return True
 
@@ -1248,6 +1326,8 @@ class BehaviorController:
         waypoint = self._find_path_around_obstacle(target, treat_trash_as_obstacles=treat_trash_as_obstacles)
         if waypoint:
             self._navigation_waypoint = waypoint
+            self._wall_follow_direction = None  # Clear wall-follow when we find a path
+            self._wall_follow_frames = 0
             self._move_toward(waypoint, dt)
             return True
 
@@ -1263,6 +1343,8 @@ class BehaviorController:
                 # Path is only blocked by trash - bulldoze through!
                 self._bulldoze_mode = True
                 self._navigation_waypoint = None
+                self._wall_follow_direction = None
+                self._wall_follow_frames = 0
                 self._move_toward(target, dt)
                 return True
 
@@ -1271,15 +1353,39 @@ class BehaviorController:
             if waypoint:
                 self._bulldoze_mode = True
                 self._navigation_waypoint = waypoint
+                self._wall_follow_direction = None
+                self._wall_follow_frames = 0
                 self._move_toward(waypoint, dt)
                 return True
 
-        # Couldn't find a path - fall back to wall-following
+        # =====================================================================
+        # WALL-FOLLOWING: Last resort - follow the obstacle wall
+        # =====================================================================
         if self._wall_follow_direction is None:
             self._wall_follow_direction = self._pick_best_wall_follow_direction(target)
             self._wall_follow_frames = 0
 
-        self._move_toward(target, dt)
+        # Increment wall follow commitment counter
+        self._wall_follow_frames += 1
+
+        # Check if we should switch directions (after committing for a while)
+        if self._wall_follow_frames >= self._wall_follow_max_frames:
+            # Switch direction and try again
+            self._wall_follow_direction = 'right' if self._wall_follow_direction == 'left' else 'left'
+            self._wall_follow_frames = 0
+
+        # Move in wall-follow direction
+        wall_vec = self._get_wall_follow_direction_vector(target)
+        if wall_vec[0] != 0 or wall_vec[1] != 0:
+            self.robot.set_velocity(wall_vec[0], wall_vec[1])
+
+            # Face movement direction
+            target_angle = math.degrees(math.atan2(wall_vec[1], wall_vec[0]))
+            self.robot.rotate_toward(target_angle, dt)
+        else:
+            # Fallback if no vector
+            self._move_toward(target, dt)
+
         return False
 
     def _pick_wander_target(self):
@@ -1362,7 +1468,8 @@ class BehaviorController:
         robot_pos = self.robot.position
 
         # Inflate amount to account for robot body width
-        inflate_amount = int(self.robot.width * 0.6) if account_for_width else 0
+        # Use 0.9 multiplier to add safety margin - prevents trying tight gaps
+        inflate_amount = int(self.robot.width * 0.9) if account_for_width else 0
 
         # Check against each obstacle (inflated to account for robot width)
         for obstacle in self._obstacles:
@@ -1759,6 +1866,19 @@ class BehaviorController:
             self.transition_to(RobotState.PATROL)
             return
 
+        # Increment state timeout counter
+        self._state_frames += 1
+
+        # TIMEOUT: If stuck in APPROACHING too long, give up and let others try
+        if self._state_frames > self._state_timeout_frames:
+            # Release claim so other robots can try
+            if self._coordinator and self.target_trash:
+                self._coordinator.release_claim(self.target_trash.id)
+            self.target_trash = None
+            self._approach_stuck_count = 0
+            self.transition_to(RobotState.PATROL)
+            return
+
         # OPPORTUNISTIC: Check if there's closer trash we should grab instead
         closer_trash = self._find_closer_trash_on_path()
         if closer_trash:
@@ -1878,6 +1998,19 @@ class BehaviorController:
         3. Make final decision: pick up or ignore
         """
         if self._investigation_target is None:
+            self.transition_to(RobotState.PATROL)
+            return
+
+        # Increment state timeout counter
+        self._state_frames += 1
+
+        # TIMEOUT: If stuck in INVESTIGATING too long, give up and let others try
+        if self._state_frames > self._state_timeout_frames:
+            # Release claim so other robots can try
+            if self._coordinator and self._investigation_target:
+                self._coordinator.release_claim(self._investigation_target.id)
+            self._investigation_target = None
+            self._investigation_classification = None
             self.transition_to(RobotState.PATROL)
             return
 
@@ -2253,7 +2386,8 @@ class BehaviorController:
             return True
 
         # Inflate amount to account for robot body width
-        inflate_amount = int(self.robot.width * 0.6) if account_for_width else 0
+        # Use 0.9 multiplier to add safety margin - prevents trying tight gaps
+        inflate_amount = int(self.robot.width * 0.9) if account_for_width else 0
 
         for obstacle in self._obstacles:
             rect = obstacle.get_rect()
