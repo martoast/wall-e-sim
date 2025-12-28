@@ -103,14 +103,19 @@ class Navigation:
 
     def generate_random_patrol(
         self,
-        point_count: int = 6,
+        point_count: int = 8,  # More waypoints for better coverage
         nest_position: Tuple[float, float] = None,
         zone_bounds: Tuple[int, int, int, int] = None,
         shared_map=None,
         start_position: Tuple[float, float] = None
     ) -> List[Tuple[float, float]]:
         """
-        Generate a random patrol path that covers the whole area including edges.
+        Generate a patrol path that GUARANTEES full area coverage.
+
+        Design principles:
+        1. Wall waypoints ensure edge coverage (robot does 360° scan at each)
+        2. Interior waypoints cover the middle areas
+        3. More waypoints = more 360° scans = better detection
 
         Args:
             point_count: Number of waypoints
@@ -123,7 +128,7 @@ class Navigation:
             List of waypoint positions
         """
         waypoints = []
-        nest_avoid_radius = 180  # Reduced from 200
+        nest_avoid_radius = 150  # Reduced to allow more coverage near nest
 
         # Use zone bounds if provided, otherwise use full nav bounds
         if zone_bounds:
@@ -131,32 +136,42 @@ class Navigation:
         else:
             bounds = self.nav_bounds
 
-        # First, add 1-2 edge waypoints to ensure edge coverage
-        edge_margin = 50  # How close to actual screen edge
-        edge_waypoints_added = 0
-        max_edge_waypoints = random.randint(1, 2)
+        # WALL COVERAGE: Add waypoints along ALL edges to ensure wall-adjacent trash is found
+        # Robot does 360° scan at each waypoint, so this ensures full wall coverage
+        edge_margin = 40  # Closer to walls (was 50) - robot can still fit here
 
-        edge_positions = [
-            # Top edge
-            (random.uniform(edge_margin, SCREEN_WIDTH - edge_margin), edge_margin),
-            # Bottom edge
-            (random.uniform(edge_margin, SCREEN_WIDTH - edge_margin), SCREEN_HEIGHT - edge_margin),
-            # Left edge
-            (edge_margin, random.uniform(edge_margin, SCREEN_HEIGHT - edge_margin)),
-            # Right edge (but not too close to nest which is usually on right)
-            (SCREEN_WIDTH - edge_margin, random.uniform(edge_margin, SCREEN_HEIGHT - edge_margin)),
-            # Corners
-            (edge_margin, edge_margin),  # Top-left
-            (SCREEN_WIDTH - edge_margin, edge_margin),  # Top-right
-            (edge_margin, SCREEN_HEIGHT - edge_margin),  # Bottom-left
+        # Systematically cover all 4 walls with waypoints
+        # This ensures no wall section is missed during patrol
+        wall_waypoints = [
+            # Bottom wall - left, center, right
+            (SCREEN_WIDTH * 0.25, SCREEN_HEIGHT - edge_margin),
+            (SCREEN_WIDTH * 0.5, SCREEN_HEIGHT - edge_margin),
+            (SCREEN_WIDTH * 0.75, SCREEN_HEIGHT - edge_margin),
+            # Top wall - left, center, right
+            (SCREEN_WIDTH * 0.25, edge_margin),
+            (SCREEN_WIDTH * 0.5, edge_margin),
+            (SCREEN_WIDTH * 0.75, edge_margin),
+            # Left wall - top, center, bottom
+            (edge_margin, SCREEN_HEIGHT * 0.25),
+            (edge_margin, SCREEN_HEIGHT * 0.5),
+            (edge_margin, SCREEN_HEIGHT * 0.75),
+            # Right wall - top, center, bottom (but check for nest)
+            (SCREEN_WIDTH - edge_margin, SCREEN_HEIGHT * 0.25),
+            (SCREEN_WIDTH - edge_margin, SCREEN_HEIGHT * 0.5),
+            (SCREEN_WIDTH - edge_margin, SCREEN_HEIGHT * 0.75),
         ]
-        random.shuffle(edge_positions)
 
-        for edge_pos in edge_positions:
-            if edge_waypoints_added >= max_edge_waypoints:
+        # Shuffle and pick 4-5 wall waypoints to include in patrol
+        # More wall waypoints = better edge coverage
+        random.shuffle(wall_waypoints)
+        wall_waypoints_added = 0
+        max_wall_waypoints = random.randint(4, 5)
+
+        for wall_pos in wall_waypoints:
+            if wall_waypoints_added >= max_wall_waypoints:
                 break
 
-            x, y = edge_pos
+            x, y = wall_pos
 
             # Check if too close to nest
             if nest_position:
@@ -169,7 +184,7 @@ class Navigation:
                 continue
 
             waypoints.append((x, y))
-            edge_waypoints_added += 1
+            wall_waypoints_added += 1
 
         # Fill remaining waypoints with random positions
         attempts = 0

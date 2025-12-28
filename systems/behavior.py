@@ -45,9 +45,30 @@ from systems.telemetry import EventType
 # =============================================================================
 
 # These determine when the robot acts vs investigates
-CONFIDENT_PICKUP_THRESHOLD = 0.60    # Above this = definitely pick up
-INVESTIGATION_THRESHOLD = 0.35       # Above this = move closer to verify (lowered for tiny trash)
-IGNORE_THRESHOLD = 0.25              # Below this = definitely ignore
+CONFIDENT_PICKUP_THRESHOLD = 0.55    # Above this = definitely pick up
+INVESTIGATION_THRESHOLD = 0.20       # Above this = move closer to verify
+IGNORE_THRESHOLD = 0.15              # Below this + high confidence = definitely not trash
+
+# FEATURE-BASED AMBIGUITY DETECTION (elegant MIT robotics approach)
+# =================================================================
+# Even if overall trash_probability is low, if ANY individual feature
+# suggests "this might be trash", we should investigate.
+# This catches objects where one feature is elevated but others drag down the average.
+#
+# Example: A tan stick might get:
+#   - shape: 0.65 (elongated = could be straw/cigarette)  <-- ELEVATED!
+#   - color: 0.30 (natural brown)
+#   - material: 0.50 (organic)
+#   - Overall: 0.40 (below investigation threshold)
+#
+# With feature-based detection, the elevated shape score triggers investigation.
+FEATURE_INVESTIGATE_THRESHOLD = 0.55  # If ANY feature score >= this, investigate
+
+# Low confidence = investigate (robot isn't sure)
+LOW_CONFIDENCE_INVESTIGATE_THRESHOLD = 0.60
+
+# Distance threshold for making permanent decisions
+CLOSE_INSPECTION_DISTANCE = 80
 
 
 class BehaviorController:
@@ -126,9 +147,9 @@ class BehaviorController:
         self._wall_follow_max_frames = 90  # Try one direction for ~3 seconds before switching
         self._tried_both_directions = False
 
-        # Simple stuck detection
+        # Simple stuck detection - faster detection for responsive obstacle avoidance
         self._stuck_frames = 0
-        self._stuck_threshold = 15  # Frames without movement to consider stuck
+        self._stuck_threshold = 10  # Frames without movement to consider stuck (was 15)
 
         # Goal tracking
         self._current_goal: Optional[Tuple[float, float]] = None
@@ -137,6 +158,7 @@ class BehaviorController:
         self._return_stuck_count = 0
         self._return_waypoint: Optional[Tuple[float, float]] = None
         self._navigation_waypoint: Optional[Tuple[float, float]] = None
+        self._bulldoze_mode: bool = False  # Push through trash when stuck
 
         # References (set during update)
         self._coordinator: Optional['Coordinator'] = None
@@ -152,10 +174,9 @@ class BehaviorController:
         self._is_scanning = False         # Currently doing a 360° scan?
         self._scan_start_angle = 0.0      # Angle when scan started
         self._scan_rotation = 0.0         # How many degrees we've rotated so far
-        self._scan_speed = 3.0            # Degrees per frame during scan rotation
-        self._frames_since_scan = 0       # Frames since last 360° scan
-        self._scan_interval = 90          # Do a 360° scan every ~3 seconds (or at waypoints)
-        self._scan_at_waypoint = True     # Also scan when reaching each waypoint
+        self._scan_speed = 2.5            # Degrees per frame - slower for thorough scanning
+        self._scan_at_waypoint = True     # Scan when reaching each waypoint
+        self._objects_seen_this_scan: set = set()  # Track what we've checked this scan
 
         # ==============================================
         # WAITING STATE TRACKING
@@ -206,7 +227,7 @@ class BehaviorController:
         self._is_scanning = True
         self._scan_start_angle = self.robot.angle
         self._scan_rotation = 0.0
-        self._frames_since_scan = 0
+        self._objects_seen_this_scan.clear()  # Fresh scan
 
     def _update_360_scan(self, dt: float, trash_group) -> bool:
         """
@@ -226,7 +247,6 @@ class BehaviorController:
         # Check if we've completed 360°
         if self._scan_rotation >= 360:
             self._is_scanning = False
-            self._frames_since_scan = 0
             return True
 
         # During rotation, check for trash in our FOV
@@ -236,7 +256,6 @@ class BehaviorController:
         if target_result:
             obj, classification, action = target_result
             self._is_scanning = False  # Stop scanning, we found something!
-            self._frames_since_scan = 0
 
             if action == 'pickup':
                 self.target_trash = obj
@@ -258,11 +277,6 @@ class BehaviorController:
 
         return False  # Still scanning
 
-    def _should_start_scan(self) -> bool:
-        """Check if it's time to do a 360° scan."""
-        if self._is_scanning:
-            return False
-        return self._frames_since_scan >= self._scan_interval
 
     def _get_scan_look_angle(self) -> float:
         """
@@ -314,7 +328,6 @@ class BehaviorController:
         """Reset scanning state (called when trash is found)."""
         # Stop any 360° scan in progress - we found something!
         self._is_scanning = False
-        self._frames_since_scan = 0
 
     # ==============================================
     # PHASE 2: Perception-based object detection
@@ -388,26 +401,68 @@ class BehaviorController:
             if self._coordinator and self._coordinator.is_claimed_by_other(obj, self.robot.id):
                 continue
 
-            # Skip if we don't have line of sight (obstacles blocking)
-            if not self._has_line_of_sight(obj.position):
+            # Skip if we don't have VISUAL line of sight (obstacles blocking view)
+            # IMPORTANT: Use account_for_width=False for VISION detection!
+            # The robot's eyes can SEE an object even if its body can't FIT through.
+            # We only care about visual occlusion here, not pathfinding.
+            if not self._has_line_of_sight(obj.position, account_for_width=False):
                 continue
 
-            # Decide based on classification
-            if classification.trash_probability >= CONFIDENT_PICKUP_THRESHOLD:
-                # High confidence - pick it up
-                if classification.confidence >= 0.15:
-                    return (obj, classification, 'pickup')
+            # Calculate distance to object
+            dist_to_obj = distance(self.robot.position, obj.position)
 
-            elif classification.trash_probability >= INVESTIGATION_THRESHOLD:
-                # Medium confidence - investigate (very low confidence req for tiny objects)
-                if classification.confidence >= 0.1:
-                    return (obj, classification, 'investigate')
+            # =======================================================
+            # DECISION LOGIC - MIT Robotics Approach
+            # =======================================================
+            # We check multiple conditions for investigation to ensure
+            # we never miss something that could be trash.
 
-            else:
-                # Below threshold - record ignore decision (for scoring)
-                # Only record if we haven't already decided on this object
-                if obj.id not in self.scoring.objects_decided:
-                    self._make_ignore_decision(obj, classification, investigated=False)
+            trash_prob = classification.trash_probability
+            confidence = classification.confidence
+            feature_scores = classification.feature_scores
+
+            # CHECK 1: High probability = pick it up
+            if trash_prob >= CONFIDENT_PICKUP_THRESHOLD and confidence >= 0.10:
+                return (obj, classification, 'pickup')
+
+            # CHECK 2: Medium probability = investigate
+            if trash_prob >= INVESTIGATION_THRESHOLD:
+                return (obj, classification, 'investigate')
+
+            # CHECK 3: Low confidence = investigate (robot isn't sure)
+            if confidence < LOW_CONFIDENCE_INVESTIGATE_THRESHOLD:
+                return (obj, classification, 'investigate')
+
+            # CHECK 4: FEATURE-BASED AMBIGUITY DETECTION
+            # =============================================
+            # Even if overall probability is low, if ANY individual feature
+            # suggests "this might be trash", investigate it.
+            # This is the key insight - a weighted average can hide important signals.
+            #
+            # Example: A tan elongated stick
+            #   - shape: 0.65 (elongated = straw/cigarette?)  <-- ELEVATED
+            #   - color: 0.30 (natural brown)
+            #   - texture: 0.40 (matte)
+            #   - Overall: ~0.35 (would be ignored)
+            #   - But shape=0.65 >= 0.55 triggers investigation!
+
+            max_feature_score = max(feature_scores.values()) if feature_scores else 0.0
+            if max_feature_score >= FEATURE_INVESTIGATE_THRESHOLD:
+                return (obj, classification, 'investigate')
+
+            # =======================================================
+            # DEFAULT: INVESTIGATE ANYTHING WE HAVEN'T LOOKED AT
+            # =======================================================
+            # If we reach here, no positive signal triggered investigation.
+            # But the elegant principle is: "When in doubt, investigate."
+            #
+            # Rather than silently ignoring objects that don't trigger our
+            # checks, we investigate EVERYTHING we see at least once.
+            # Only after investigation can we confidently say "not trash".
+            #
+            # This ensures we never miss trash just because our heuristics
+            # didn't catch it - the robot will physically go look at everything.
+            return (obj, classification, 'investigate')
 
         return None
 
@@ -820,6 +875,408 @@ class BehaviorController:
 
         return (final_x * self.robot.current_speed, final_y * self.robot.current_speed)
 
+    def _pick_best_wall_follow_direction(self, goal: Tuple[float, float]) -> str:
+        """
+        Pick the best wall-following direction to get around an obstacle.
+
+        Checks both left and right directions and picks the one that seems
+        more open (better line of sight toward the goal from that side).
+        """
+        robot_pos = self.robot.position
+
+        # Vector to goal
+        dx = goal[0] - robot_pos[0]
+        dy = goal[1] - robot_pos[1]
+        dist_to_goal = math.sqrt(dx * dx + dy * dy)
+
+        if dist_to_goal < 1:
+            return 'left'  # Default
+
+        # Normalize
+        dx /= dist_to_goal
+        dy /= dist_to_goal
+
+        # Check points to the left and right of the obstacle
+        check_distance = 80  # How far to the side to check
+
+        # Left perpendicular
+        left_x = robot_pos[0] + (-dy) * check_distance
+        left_y = robot_pos[1] + (dx) * check_distance
+
+        # Right perpendicular
+        right_x = robot_pos[0] + (dy) * check_distance
+        right_y = robot_pos[1] + (-dx) * check_distance
+
+        # Check which side has better line of sight toward goal
+        left_clear = self._has_line_of_sight((left_x, left_y))
+        right_clear = self._has_line_of_sight((right_x, right_y))
+
+        if left_clear and not right_clear:
+            return 'left'
+        elif right_clear and not left_clear:
+            return 'right'
+        else:
+            # Both clear or both blocked - prefer left (like ants)
+            return 'left'
+
+    # ==========================================================================
+    # VISION-BASED PATHFINDING - Robot sees obstacles and plans around them
+    # ==========================================================================
+
+    def _find_path_around_obstacle(self, target: Tuple[float, float], treat_trash_as_obstacles: bool = False) -> Optional[Tuple[float, float]]:
+        """
+        Find an intermediate waypoint to navigate around obstacles.
+
+        When direct path is blocked, this scans the environment to find a clear
+        waypoint that eventually leads to the target. Like a robot using its
+        camera to see obstacles and plan a route around them.
+
+        Args:
+            target: Target position to navigate to
+            treat_trash_as_obstacles: If True, also avoid trash (for RETURNING state)
+
+        Returns:
+            A waypoint position to navigate to, or None if no path found
+        """
+        from config import SCREEN_WIDTH, SCREEN_HEIGHT
+
+        robot_pos = self.robot.position
+
+        # Direction to target
+        to_target_x = target[0] - robot_pos[0]
+        to_target_y = target[1] - robot_pos[1]
+        target_dist = math.sqrt(to_target_x**2 + to_target_y**2)
+
+        if target_dist < 1:
+            return None
+
+        target_angle = math.atan2(to_target_y, to_target_x)
+
+        # Scan at multiple angles to find clear paths
+        # Start close to target direction, expand outward
+        best_waypoint = None
+        best_score = float('-inf')
+
+        # Try different waypoint distances
+        for waypoint_dist in [60, 100, 150]:
+            # Try angles spreading out from target direction
+            for angle_offset in [20, 40, 60, 80, 100, 120, 140, 160, 180]:
+                for direction in [1, -1]:  # Try both sides
+                    angle = target_angle + math.radians(angle_offset * direction)
+
+                    # Calculate waypoint position
+                    wx = robot_pos[0] + math.cos(angle) * waypoint_dist
+                    wy = robot_pos[1] + math.sin(angle) * waypoint_dist
+
+                    # Clamp to screen bounds
+                    margin = 50
+                    wx = max(margin, min(SCREEN_WIDTH - margin, wx))
+                    wy = max(margin, min(SCREEN_HEIGHT - margin, wy))
+
+                    waypoint = (wx, wy)
+
+                    # Skip if we can't reach this waypoint
+                    # CRITICAL: account_for_width=True ensures robot body can fit!
+                    if not self._has_line_of_sight(
+                        waypoint,
+                        account_for_width=True,
+                        treat_trash_as_obstacles=treat_trash_as_obstacles
+                    ):
+                        continue
+
+                    # Score this waypoint based on:
+                    # 1. Progress toward target (closer to target = better)
+                    # 2. Can we see the target from waypoint? (bonus)
+                    # 3. Prefer smaller angle deviations
+
+                    # Distance from waypoint to target
+                    wp_to_target = math.sqrt((target[0] - wx)**2 + (target[1] - wy)**2)
+
+                    # Progress = reduction in distance to target
+                    progress = target_dist - wp_to_target
+
+                    # Angle penalty (prefer paths closer to direct route)
+                    angle_penalty = angle_offset * 0.5
+
+                    # Check if waypoint has line of sight to target (big bonus!)
+                    # Also account for width on the second leg of the path
+                    waypoint_sees_target = self._has_line_of_sight_from(
+                        waypoint, target,
+                        treat_trash_as_obstacles=treat_trash_as_obstacles,
+                        account_for_width=True
+                    )
+                    target_visibility_bonus = 100 if waypoint_sees_target else 0
+
+                    score = progress - angle_penalty + target_visibility_bonus
+
+                    if score > best_score:
+                        best_score = score
+                        best_waypoint = waypoint
+
+        return best_waypoint
+
+    def _detect_if_in_wedge(self) -> bool:
+        """
+        Detect if robot is stuck in a wedge/corner between obstacles.
+
+        A wedge is when obstacles are close on multiple sides, making
+        wall-following ineffective. The robot needs to back out.
+
+        IMPORTANT: Uses robot body width to check if the robot can actually
+        fit through gaps, not just if a point is reachable.
+        """
+        robot_pos = self.robot.position
+
+        # When bin is full, treat trash as obstacles too
+        treat_trash_as_obstacles = self.robot.bin_full
+
+        # Check 12 directions around the robot for better precision
+        blocked_directions = 0
+        directions_checked = 12
+
+        # Check at multiple distances - if blocked at ALL distances, it's truly blocked
+        check_distances = [40, 70, 100]
+
+        for i in range(directions_checked):
+            angle = (2 * math.pi * i) / directions_checked
+            direction_blocked = True
+
+            # A direction is only open if we can reach ANY of the check distances
+            for check_distance in check_distances:
+                check_x = robot_pos[0] + math.cos(angle) * check_distance
+                check_y = robot_pos[1] + math.sin(angle) * check_distance
+
+                # CRITICAL: account_for_width=True ensures robot body can fit!
+                if self._has_line_of_sight(
+                    (check_x, check_y),
+                    account_for_width=True,
+                    treat_trash_as_obstacles=treat_trash_as_obstacles
+                ):
+                    direction_blocked = False
+                    break
+
+            if direction_blocked:
+                blocked_directions += 1
+
+        # If more than 2/3 of directions are blocked, we're in a wedge
+        # More strict threshold for better detection
+        return blocked_directions >= (directions_checked * 2) // 3
+
+    def _backup_from_obstacle(self, target: Tuple[float, float]) -> Optional[Tuple[float, float]]:
+        """
+        Find a backup position to escape from a wedge/corner.
+
+        When stuck in a tight space, the robot needs to reverse to a more
+        open area before trying to navigate around obstacles.
+
+        IMPORTANT: Uses robot body width to ensure the robot can actually
+        fit through the escape path, not just that a point is reachable.
+
+        Returns:
+            A position to back up to, or None
+        """
+        from config import SCREEN_WIDTH, SCREEN_HEIGHT
+
+        robot_pos = self.robot.position
+
+        # When bin is full, treat trash as obstacles too
+        treat_trash_as_obstacles = self.robot.bin_full
+
+        # Direction AWAY from target (backing up)
+        to_target_x = target[0] - robot_pos[0]
+        to_target_y = target[1] - robot_pos[1]
+        target_dist = math.sqrt(to_target_x**2 + to_target_y**2)
+
+        if target_dist < 1:
+            # No clear target direction - scan all directions for ANY escape
+            away_angle = 0
+        else:
+            # Reverse direction
+            away_angle = math.atan2(-to_target_y, -to_target_x)
+
+        # =================================================================
+        # STRATEGY 1: Try backing up away from target at various angles
+        # =================================================================
+        for backup_dist in [50, 80, 120, 160]:
+            for angle_offset in [0, 30, -30, 60, -60, 90, -90, 120, -120, 150, -150, 180]:
+                angle = away_angle + math.radians(angle_offset)
+
+                bx = robot_pos[0] + math.cos(angle) * backup_dist
+                by = robot_pos[1] + math.sin(angle) * backup_dist
+
+                # Clamp to screen
+                margin = 50
+                bx = max(margin, min(SCREEN_WIDTH - margin, bx))
+                by = max(margin, min(SCREEN_HEIGHT - margin, by))
+
+                backup_pos = (bx, by)
+
+                # Skip if clamping made it too close
+                if distance(robot_pos, backup_pos) < 30:
+                    continue
+
+                # CRITICAL: account_for_width=True ensures robot body can fit!
+                if self._has_line_of_sight(
+                    backup_pos,
+                    account_for_width=True,
+                    treat_trash_as_obstacles=treat_trash_as_obstacles
+                ):
+                    return backup_pos
+
+        # =================================================================
+        # STRATEGY 2: Full 360° scan for ANY escape route
+        # =================================================================
+        # If backing away from target didn't work, try every direction
+        for backup_dist in [40, 60, 90, 130]:
+            for i in range(16):  # Check 16 directions
+                angle = (2 * math.pi * i) / 16
+
+                bx = robot_pos[0] + math.cos(angle) * backup_dist
+                by = robot_pos[1] + math.sin(angle) * backup_dist
+
+                # Clamp to screen
+                bx = max(margin, min(SCREEN_WIDTH - margin, bx))
+                by = max(margin, min(SCREEN_HEIGHT - margin, by))
+
+                backup_pos = (bx, by)
+
+                if distance(robot_pos, backup_pos) < 25:
+                    continue
+
+                if self._has_line_of_sight(
+                    backup_pos,
+                    account_for_width=True,
+                    treat_trash_as_obstacles=treat_trash_as_obstacles
+                ):
+                    return backup_pos
+
+        # =================================================================
+        # STRATEGY 3: Desperate - try without width check (squeeze through)
+        # =================================================================
+        for backup_dist in [30, 50, 80]:
+            for i in range(12):
+                angle = (2 * math.pi * i) / 12
+
+                bx = robot_pos[0] + math.cos(angle) * backup_dist
+                by = robot_pos[1] + math.sin(angle) * backup_dist
+
+                bx = max(margin, min(SCREEN_WIDTH - margin, bx))
+                by = max(margin, min(SCREEN_HEIGHT - margin, by))
+
+                backup_pos = (bx, by)
+
+                if distance(robot_pos, backup_pos) < 20:
+                    continue
+
+                # No width check - desperate escape attempt
+                if self._has_line_of_sight(
+                    backup_pos,
+                    account_for_width=False,
+                    treat_trash_as_obstacles=treat_trash_as_obstacles
+                ):
+                    return backup_pos
+
+        return None
+
+    def _smart_navigate_to_target(self, target: Tuple[float, float], dt: float, treat_trash_as_obstacles: bool = None) -> bool:
+        """
+        Smart navigation that sees obstacles and plans around them.
+
+        This is the main navigation function that combines:
+        1. Direct movement when path is clear
+        2. Waypoint planning when blocked
+        3. Backup behavior when in a wedge
+        4. BULLDOZE MODE: When truly stuck, push through trash (it's movable!)
+
+        Args:
+            target: Position to navigate to
+            dt: Delta time
+            treat_trash_as_obstacles: If True, treat trash as obstacles (auto-detect if None)
+
+        Returns:
+            True if making progress, False if completely stuck
+        """
+        robot_pos = self.robot.position
+
+        # Auto-detect if we should treat trash as obstacles
+        # When bin is full (RETURNING/WAITING), we can't pick up trash so it blocks us
+        if treat_trash_as_obstacles is None:
+            treat_trash_as_obstacles = self.robot.bin_full
+
+        # Check if direct path is clear
+        if self._has_line_of_sight(target, treat_trash_as_obstacles=treat_trash_as_obstacles):
+            # Clear path - go directly
+            self._navigation_waypoint = None
+            self._bulldoze_mode = False
+            self._move_toward(target, dt)
+            return True
+
+        # Path is blocked - do we have a navigation waypoint?
+        if self._navigation_waypoint:
+            # Check if we reached the waypoint
+            dist_to_wp = distance(robot_pos, self._navigation_waypoint)
+            if dist_to_wp < 30:
+                # Reached waypoint - clear it and try direct path again
+                self._navigation_waypoint = None
+                return True
+
+            # Check if waypoint is still reachable (in bulldoze mode, ignore trash)
+            check_trash = treat_trash_as_obstacles and not getattr(self, '_bulldoze_mode', False)
+            if self._has_line_of_sight(self._navigation_waypoint, treat_trash_as_obstacles=check_trash):
+                self._move_toward(self._navigation_waypoint, dt)
+                return True
+            else:
+                # Waypoint became blocked - find new one
+                self._navigation_waypoint = None
+
+        # Need to find a path around the obstacle
+        # First check if we're in a wedge (need to back out)
+        if self._detect_if_in_wedge():
+            # We're trapped - try to back out
+            backup_pos = self._backup_from_obstacle(target)
+            if backup_pos:
+                self._navigation_waypoint = backup_pos
+                self._move_toward(backup_pos, dt)
+                return True
+
+        # Not in a wedge - find a waypoint around the obstacle
+        waypoint = self._find_path_around_obstacle(target, treat_trash_as_obstacles=treat_trash_as_obstacles)
+        if waypoint:
+            self._navigation_waypoint = waypoint
+            self._move_toward(waypoint, dt)
+            return True
+
+        # =====================================================================
+        # BULLDOZE MODE: We're stuck and treating trash as obstacles.
+        # But trash is PUSHABLE unlike real obstacles! Try again ignoring trash.
+        # The physics system will push the trash out of the way as we move.
+        # =====================================================================
+        if treat_trash_as_obstacles:
+            # Try to find a path that goes THROUGH trash (we'll push it)
+            # First check if direct path is clear of REAL obstacles only
+            if self._has_line_of_sight(target, treat_trash_as_obstacles=False):
+                # Path is only blocked by trash - bulldoze through!
+                self._bulldoze_mode = True
+                self._navigation_waypoint = None
+                self._move_toward(target, dt)
+                return True
+
+            # Try finding a waypoint ignoring trash
+            waypoint = self._find_path_around_obstacle(target, treat_trash_as_obstacles=False)
+            if waypoint:
+                self._bulldoze_mode = True
+                self._navigation_waypoint = waypoint
+                self._move_toward(waypoint, dt)
+                return True
+
+        # Couldn't find a path - fall back to wall-following
+        if self._wall_follow_direction is None:
+            self._wall_follow_direction = self._pick_best_wall_follow_direction(target)
+            self._wall_follow_frames = 0
+
+        self._move_toward(target, dt)
+        return False
+
     def _pick_wander_target(self):
         """
         Pick a location to wander to - prioritize directions with clear line of sight!
@@ -1074,7 +1531,7 @@ class BehaviorController:
         Real robotics approach:
         1. Robot has forward-facing camera (FOV cone = body direction)
         2. For 360° coverage, robot must physically rotate
-        3. Periodic 360° scans + scans at each waypoint ensure full coverage
+        3. At each waypoint, robot does a 360° scan to check all directions
         4. Any object detected in FOV triggers investigation/pickup
         """
         # ==============================================
@@ -1085,14 +1542,6 @@ class BehaviorController:
             scan_complete = self._update_360_scan(dt, trash_group)
             if not scan_complete:
                 return  # Still scanning, don't move
-
-        # Increment scan timer
-        self._frames_since_scan += 1
-
-        # Check if it's time for a periodic 360° scan
-        if self._should_start_scan() and not self.robot.bin_full:
-            self._start_360_scan()
-            return
 
         # ==============================================
         # FORWARD DETECTION - Check what's in our FOV as we move
@@ -1284,8 +1733,9 @@ class BehaviorController:
             self.transition_to(RobotState.PICKING)
             return
 
-        # Move toward trash (this also rotates to face it)
-        self._move_toward(trash_pos, dt)
+        # Use SMART NAVIGATION to move toward trash
+        # This handles obstacles intelligently instead of just bumping into them
+        self._smart_navigate_to_target(trash_pos, dt)
 
     def _find_closer_trash_on_path(self) -> Optional['Trash']:
         """
@@ -1375,9 +1825,20 @@ class BehaviorController:
             # We're close enough - make final decision
             self.scoring.record_investigation(self._investigation_target, self.robot.id)
 
-            # Lower threshold since we investigated because we thought it might be trash
-            # If trash_prob > 0.4 at close range, it's probably worth picking up
-            if classification.trash_probability >= 0.4 and classification.confidence >= 0.25:
+            # PRINCIPLE: "When in doubt, pick it up"
+            # We investigated because we were UNCERTAIN. If we're STILL uncertain
+            # after getting close, that means this object is ambiguous - pick it up
+            # to be safe. Round shapes and natural colors can fool the classifier.
+            #
+            # Pick up if:
+            # 1. trash_probability >= 0.25 (even slightly leans toward trash), OR
+            # 2. confidence < 0.65 (still uncertain = better safe than sorry)
+            should_pickup = (
+                classification.trash_probability >= 0.25 or
+                classification.confidence < 0.65
+            )
+
+            if should_pickup:
                 # Decided it's trash - pick it up
                 # Note: Scoring is recorded when pickup actually succeeds in _execute_picking
                 # Store the classification for scoring later
@@ -1424,17 +1885,9 @@ class BehaviorController:
                 self.transition_to(RobotState.PATROL)
                 return
 
-        # Move closer to investigate
-        target_angle = angle_to(self.robot.position, target_pos)
-        self.robot.rotate_toward(target_angle, dt)
-
-        # Only move if roughly facing target
-        angle_difference = abs(self.robot.angle - target_angle) % 360
-        if angle_difference > 180:
-            angle_difference = 360 - angle_difference
-
-        if angle_difference < 30:
-            self._move_toward(target_pos, dt)
+        # Move closer to investigate using SMART NAVIGATION
+        # Robot sees obstacles and plans a path around them
+        self._smart_navigate_to_target(target_pos, dt)
 
     def _execute_picking(self, dt: float, trash_group: pygame.sprite.Group, obstacles: pygame.sprite.Group):
         """
@@ -1599,7 +2052,7 @@ class BehaviorController:
             self.transition_to(RobotState.RETURNING)
 
     def _execute_returning(self, dt: float, obstacles: pygame.sprite.Group):
-        """Returning: navigate to nest ramp, going around obstacles if needed."""
+        """Returning: navigate to nest ramp using SMART NAVIGATION around obstacles."""
         ramp_entry = self.nest.get_ramp_entry()
         dist_to_ramp = distance(self.robot.position, ramp_entry)
 
@@ -1616,34 +2069,17 @@ class BehaviorController:
                     self._coordinator.claim_ramp(self.robot.id)
                 self._return_waypoint = None
                 self._return_stuck_count = 0
+                self._navigation_waypoint = None  # Clear smart nav waypoint too
                 self.transition_to(RobotState.DOCKING)
             else:
                 # Ramp busy or not our turn - go to waiting area
                 self.transition_to(RobotState.WAITING)
             return
 
-        # If we have a waypoint to navigate around an obstacle
-        if self._return_waypoint:
-            dist_to_waypoint = distance(self.robot.position, self._return_waypoint)
-            if dist_to_waypoint < 30:
-                # Reached the waypoint - this is progress!
-                self._return_waypoint = None
-                self._return_stuck_count = max(0, self._return_stuck_count - 1)
-                self._reset_progress_tracking()
-            else:
-                self._move_toward(self._return_waypoint, dt)
-                return
-
-        # Check if direct path to nest is blocked
-        if not self._has_line_of_sight(ramp_entry, account_for_width=True, treat_trash_as_obstacles=True):
-            waypoint = self._find_return_waypoint(ramp_entry)
-            if waypoint:
-                self._return_waypoint = waypoint
-                self._move_toward(self._return_waypoint, dt)
-                return
-
-        # Direct path is clear - move toward nest
-        self._move_toward(ramp_entry, dt)
+        # Use SMART NAVIGATION to get to the nest
+        # This handles obstacles intelligently with wedge detection and backup
+        # treat_trash_as_obstacles=True because we can't pick up trash when returning
+        self._smart_navigate_to_target(ramp_entry, dt, treat_trash_as_obstacles=True)
 
     def _find_return_waypoint(self, target: Tuple[float, float]) -> Optional[Tuple[float, float]]:
         """
@@ -1699,22 +2135,37 @@ class BehaviorController:
 
         return None
 
-    def _has_line_of_sight_from(self, start: Tuple[float, float], target: Tuple[float, float], treat_trash_as_obstacles: bool = False) -> bool:
-        """Check line of sight from an arbitrary point (not robot position)."""
+    def _has_line_of_sight_from(
+        self,
+        start: Tuple[float, float],
+        target: Tuple[float, float],
+        treat_trash_as_obstacles: bool = False,
+        account_for_width: bool = True
+    ) -> bool:
+        """
+        Check line of sight from an arbitrary point (not robot position).
+
+        Args:
+            start: Starting position
+            target: Target position
+            treat_trash_as_obstacles: If True, treat trash as obstacles
+            account_for_width: If True, inflate obstacles by robot width
+        """
         if self._obstacles is None:
             return True
 
-        inflate_amount = int(self.robot.width * 0.6)
+        # Inflate amount to account for robot body width
+        inflate_amount = int(self.robot.width * 0.6) if account_for_width else 0
 
         for obstacle in self._obstacles:
             rect = obstacle.get_rect()
-            inflated_rect = rect.inflate(inflate_amount, inflate_amount)
+            inflated_rect = rect.inflate(inflate_amount, inflate_amount) if inflate_amount > 0 else rect
             if self._line_intersects_rect(start, target, inflated_rect):
                 return False
 
         # Check nest
         nest_rect = self.nest.get_rect()
-        inflated_nest = nest_rect.inflate(inflate_amount, inflate_amount)
+        inflated_nest = nest_rect.inflate(inflate_amount, inflate_amount) if inflate_amount > 0 else nest_rect
         if self._line_intersects_rect(start, target, inflated_nest):
             return False
 
@@ -1729,6 +2180,8 @@ class BehaviorController:
                     (trash.size + 10) * 2,
                     (trash.size + 10) * 2
                 )
+                if inflate_amount > 0:
+                    trash_rect = trash_rect.inflate(inflate_amount, inflate_amount)
                 if self._line_intersects_rect(start, target, trash_rect):
                     return False
 

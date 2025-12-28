@@ -1,157 +1,60 @@
 WALL-E Simulation Telemetry Log
-Duration: 26.95s
-Total Events: 145
+Duration: 4.07s
+Total Events: 48
 
 --- Statistics ---
-total_trash_collected: 20
-total_trash_dumped: 6
-total_distance_traveled: 23401.295632105175
-state_changes: 124
+total_trash_collected: 7
+total_trash_dumped: 0
+total_distance_traveled: 1766.3143278976852
+state_changes: 41
 collisions: 0
 
 --- Events ---
-[0.00] Robot 0 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[0.00] Robot 6 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[0.00] Robot 7 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[0.00] Robot 8 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[0.40] Robot 8 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[0.44] Robot 7 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[0.44] Robot 8 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[0.47] Robot 7 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[0.47] Robot 8 - state_change: {'from': 'approaching', 'to': 'picking'}
-[0.50] Robot 0 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[0.50] Robot 7 - state_change: {'from': 'approaching', 'to': 'picking'}
-[0.54] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[0.57] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
-[0.57] Robot 8 - trash_pickup: {'trash_id': 51}
-[0.57] Robot 8 - state_change: {'from': 'picking', 'to': 'storing'}
-[0.61] Robot 7 - trash_pickup: {'trash_id': 57}
-[0.61] Robot 7 - state_change: {'from': 'picking', 'to': 'storing'}
-[0.67] Robot 0 - trash_pickup: {'trash_id': 52}
-[0.67] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
-[0.67] Robot 8 - state_change: {'from': 'storing', 'to': 'patrol'}
-[0.71] Robot 7 - state_change: {'from': 'storing', 'to': 'patrol'}
-[0.77] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
-[0.84] Robot 6 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[0.88] Robot 6 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[0.91] Robot 6 - state_change: {'from': 'approaching', 'to': 'picking'}
-[1.01] Robot 6 - trash_pickup: {'trash_id': 43}
-[1.01] Robot 6 - state_change: {'from': 'picking', 'to': 'storing'}
-[1.11] Robot 6 - state_change: {'from': 'storing', 'to': 'patrol'}
-[1.52] Robot 6 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[2.30] Robot 6 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[2.34] Robot 6 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[2.37] Robot 6 - state_change: {'from': 'approaching', 'to': 'picking'}
-[2.47] Robot 6 - trash_pickup: {'trash_id': 47}
-[2.47] Robot 6 - state_change: {'from': 'picking', 'to': 'storing'}
-[2.51] Robot 8 - state_change: {'from': 'patrol', 'to': 'seeking'}
-[2.54] Robot 8 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[2.58] Robot 6 - state_change: {'from': 'storing', 'to': 'patrol'}
-[3.15] Robot 8 - state_change: {'from': 'approaching', 'to': 'picking'}
-[3.26] Robot 8 - trash_pickup: {'trash_id': 42}
-[3.26] Robot 8 - state_change: {'from': 'picking', 'to': 'storing'}
-[3.36] Robot 8 - state_change: {'from': 'storing', 'to': 'patrol'}
-[3.39] Robot 3 - state_change: {'from': 'patrol', 'to': 'seeking'}
-[3.49] Robot 3 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[4.11] Robot 3 - state_change: {'from': 'approaching', 'to': 'picking'}
-[4.11] Robot 8 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[4.21] Robot 3 - trash_pickup: {'trash_id': 49}
-[4.21] Robot 3 - state_change: {'from': 'picking', 'to': 'storing'}
-[4.31] Robot 3 - state_change: {'from': 'storing', 'to': 'patrol'}
-[5.16] Robot 8 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[5.20] Robot 8 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[5.23] Robot 8 - state_change: {'from': 'approaching', 'to': 'picking'}
-[5.33] Robot 8 - trash_pickup: {'trash_id': 53}
-[5.33] Robot 8 - state_change: {'from': 'picking', 'to': 'storing'}
-[5.43] Robot 8 - state_change: {'from': 'storing', 'to': 'patrol'}
-[6.04] Robot 6 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[6.04] Robot 8 - state_change: {'from': 'patrol', 'to': 'seeking'}
-[6.11] Robot 8 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[6.59] Robot 8 - state_change: {'from': 'approaching', 'to': 'picking'}
-[6.69] Robot 8 - trash_pickup: {'trash_id': 59}
-[6.69] Robot 8 - state_change: {'from': 'picking', 'to': 'storing'}
-[6.79] Robot 8 - state_change: {'from': 'storing', 'to': 'patrol'}
-[7.00] Robot 6 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[7.03] Robot 6 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[7.06] Robot 6 - state_change: {'from': 'approaching', 'to': 'picking'}
-[7.13] Robot 8 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[7.16] Robot 6 - trash_pickup: {'trash_id': 50}
-[7.16] Robot 6 - state_change: {'from': 'picking', 'to': 'storing'}
-[7.27] Robot 6 - state_change: {'from': 'storing', 'to': 'patrol'}
-[7.78] Robot 8 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[7.81] Robot 8 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[7.84] Robot 2 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[7.84] Robot 8 - state_change: {'from': 'approaching', 'to': 'picking'}
-[7.95] Robot 8 - trash_pickup: {'trash_id': 45}
-[7.95] Robot 8 - state_change: {'from': 'picking', 'to': 'storing'}
-[8.05] Robot 8 - state_change: {'from': 'storing', 'to': 'patrol'}
-[8.08] Robot 8 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[8.59] Robot 2 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[8.59] Robot 8 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[8.63] Robot 2 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[8.63] Robot 8 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[8.66] Robot 2 - state_change: {'from': 'approaching', 'to': 'picking'}
-[8.66] Robot 8 - state_change: {'from': 'approaching', 'to': 'picking'}
-[8.76] Robot 2 - trash_pickup: {'trash_id': 46}
-[8.76] Robot 2 - state_change: {'from': 'picking', 'to': 'storing'}
-[8.76] Robot 8 - trash_pickup: {'trash_id': 48}
-[8.76] Robot 8 - state_change: {'from': 'picking', 'to': 'storing'}
-[8.86] Robot 2 - state_change: {'from': 'storing', 'to': 'patrol'}
-[8.86] Robot 8 - state_change: {'from': 'storing', 'to': 'patrol'}
-[9.85] Robot 3 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[10.94] Robot 3 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[10.97] Robot 3 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[11.00] Robot 3 - state_change: {'from': 'approaching', 'to': 'picking'}
-[11.11] Robot 3 - trash_pickup: {'trash_id': 41}
-[11.11] Robot 3 - state_change: {'from': 'picking', 'to': 'storing'}
-[11.21] Robot 3 - state_change: {'from': 'storing', 'to': 'patrol'}
-[11.51] Robot 3 - state_change: {'from': 'patrol', 'to': 'seeking'}
-[11.58] Robot 3 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[11.92] Robot 3 - state_change: {'from': 'approaching', 'to': 'picking'}
-[12.02] Robot 3 - trash_pickup: {'trash_id': 44}
-[12.02] Robot 3 - state_change: {'from': 'picking', 'to': 'storing'}
-[12.13] Robot 3 - state_change: {'from': 'storing', 'to': 'patrol'}
-[12.16] Robot 3 - state_change: {'from': 'patrol', 'to': 'seeking'}
-[12.19] Robot 3 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[12.74] Robot 3 - state_change: {'from': 'approaching', 'to': 'picking'}
-[12.84] Robot 3 - trash_pickup: {'trash_id': 55}
-[12.84] Robot 3 - state_change: {'from': 'picking', 'to': 'storing'}
-[12.94] Robot 3 - state_change: {'from': 'storing', 'to': 'patrol'}
-[14.27] Robot 7 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[14.41] Robot 3 - state_change: {'from': 'patrol', 'to': 'seeking'}
-[14.44] Robot 3 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[14.95] Robot 3 - state_change: {'from': 'approaching', 'to': 'picking'}
-[14.99] Robot 7 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[15.02] Robot 7 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[15.05] Robot 3 - trash_pickup: {'trash_id': 54}
-[15.05] Robot 3 - state_change: {'from': 'picking', 'to': 'storing'}
-[15.05] Robot 7 - state_change: {'from': 'approaching', 'to': 'picking'}
-[15.16] Robot 3 - state_change: {'from': 'storing', 'to': 'patrol'}
-[15.16] Robot 7 - trash_pickup: {'trash_id': 40}
-[15.16] Robot 7 - state_change: {'from': 'picking', 'to': 'storing'}
-[15.26] Robot 7 - state_change: {'from': 'storing', 'to': 'patrol'}
-[15.63] Robot 7 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[16.35] Robot 7 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[16.38] Robot 7 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[16.41] Robot 7 - state_change: {'from': 'approaching', 'to': 'picking'}
-[16.52] Robot 7 - trash_pickup: {'trash_id': 56}
-[16.52] Robot 7 - state_change: {'from': 'picking', 'to': 'storing'}
-[16.62] Robot 7 - state_change: {'from': 'storing', 'to': 'patrol'}
-[16.65] Robot 7 - state_change: {'from': 'patrol', 'to': 'investigating'}
-[17.23] Robot 7 - state_change: {'from': 'investigating', 'to': 'seeking'}
-[17.26] Robot 7 - state_change: {'from': 'seeking', 'to': 'approaching'}
-[17.30] Robot 7 - state_change: {'from': 'approaching', 'to': 'picking'}
-[17.40] Robot 7 - trash_pickup: {'trash_id': 58}
-[17.40] Robot 7 - state_change: {'from': 'picking', 'to': 'storing'}
-[17.40] Robot 8 - state_change: {'from': 'patrol', 'to': 'returning'}
-[17.43] Robot 0 - state_change: {'from': 'patrol', 'to': 'waiting'}
-[17.43] Robot 3 - state_change: {'from': 'patrol', 'to': 'waiting'}
-[17.43] Robot 6 - state_change: {'from': 'patrol', 'to': 'waiting'}
-[17.47] Robot 2 - state_change: {'from': 'patrol', 'to': 'waiting'}
-[17.50] Robot 7 - state_change: {'from': 'storing', 'to': 'waiting'}
-[19.65] Robot 8 - state_change: {'from': 'returning', 'to': 'docking'}
-[21.01] Robot 8 - state_change: {'from': 'docking', 'to': 'dumping'}
-[21.24] Robot 8 - trash_dump: {'count': 6}
-[21.62] Robot 8 - state_change: {'from': 'dumping', 'to': 'undocking'}
-[21.65] Robot 0 - state_change: {'from': 'waiting', 'to': 'returning'}
-[23.05] Robot 8 - state_change: {'from': 'undocking', 'to': 'patrol'}
+[0.00] Robot 1 - state_change: {'from': 'patrol', 'to': 'investigating'}
+[0.00] Robot 3 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[0.06] Robot 3 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[0.19] Robot 1 - state_change: {'from': 'investigating', 'to': 'seeking'}
+[0.23] Robot 1 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[0.26] Robot 1 - state_change: {'from': 'approaching', 'to': 'picking'}
+[0.36] Robot 1 - trash_pickup: {'trash_id': 60}
+[0.36] Robot 1 - state_change: {'from': 'picking', 'to': 'storing'}
+[0.36] Robot 3 - state_change: {'from': 'approaching', 'to': 'picking'}
+[0.47] Robot 1 - state_change: {'from': 'storing', 'to': 'patrol'}
+[0.47] Robot 3 - trash_pickup: {'trash_id': 61}
+[0.47] Robot 3 - state_change: {'from': 'picking', 'to': 'storing'}
+[0.57] Robot 3 - state_change: {'from': 'storing', 'to': 'patrol'}
+[0.60] Robot 3 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[0.64] Robot 3 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[0.70] Robot 3 - state_change: {'from': 'approaching', 'to': 'picking'}
+[0.81] Robot 3 - trash_pickup: {'trash_id': 63}
+[0.81] Robot 3 - state_change: {'from': 'picking', 'to': 'storing'}
+[0.91] Robot 3 - state_change: {'from': 'storing', 'to': 'patrol'}
+[1.38] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[1.52] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[1.79] Robot 1 - state_change: {'from': 'patrol', 'to': 'investigating'}
+[1.86] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[1.96] Robot 0 - trash_pickup: {'trash_id': 71}
+[1.96] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[2.06] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[2.17] Robot 0 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[2.20] Robot 0 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[2.23] Robot 1 - state_change: {'from': 'investigating', 'to': 'seeking'}
+[2.27] Robot 1 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[2.30] Robot 1 - state_change: {'from': 'approaching', 'to': 'picking'}
+[2.40] Robot 1 - trash_pickup: {'trash_id': 78}
+[2.40] Robot 1 - state_change: {'from': 'picking', 'to': 'storing'}
+[2.44] Robot 2 - state_change: {'from': 'patrol', 'to': 'investigating'}
+[2.51] Robot 1 - state_change: {'from': 'storing', 'to': 'patrol'}
+[2.57] Robot 0 - state_change: {'from': 'approaching', 'to': 'picking'}
+[2.68] Robot 0 - trash_pickup: {'trash_id': 69}
+[2.68] Robot 0 - state_change: {'from': 'picking', 'to': 'storing'}
+[2.78] Robot 0 - state_change: {'from': 'storing', 'to': 'patrol'}
+[2.78] Robot 1 - state_change: {'from': 'patrol', 'to': 'seeking'}
+[2.81] Robot 1 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[2.81] Robot 2 - state_change: {'from': 'investigating', 'to': 'seeking'}
+[2.85] Robot 2 - state_change: {'from': 'seeking', 'to': 'approaching'}
+[2.88] Robot 2 - state_change: {'from': 'approaching', 'to': 'picking'}
+[2.98] Robot 2 - trash_pickup: {'trash_id': 72}
+[2.98] Robot 2 - state_change: {'from': 'picking', 'to': 'storing'}
+[3.08] Robot 0 - state_change: {'from': 'patrol', 'to': 'investigating'}
+[3.08] Robot 2 - state_change: {'from': 'storing', 'to': 'patrol'}

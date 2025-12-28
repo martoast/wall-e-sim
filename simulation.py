@@ -219,11 +219,13 @@ class Simulation:
             obstacle_positions = [(o.x, o.y) for o in self.obstacle_group]
             obstacle_radii = [max(o.width, o.height) / 2 + 20 for o in self.obstacle_group]
             robot_positions = [(r.x, r.y) for r in self.robots]
+            # Keep trash away from nest with generous buffer
+            nest_buffer = 80
             nest_rect = (
-                self.nest.x - self.nest.width / 2 - 30,
-                self.nest.y - self.nest.height / 2 - 30,
-                self.nest.width + 60,
-                self.nest.height + 60
+                self.nest.x - self.nest.width / 2 - nest_buffer,
+                self.nest.y - self.nest.height / 2 - nest_buffer,
+                self.nest.width + nest_buffer * 2,
+                self.nest.height + nest_buffer * 2
             )
 
             objects = spawn_initial_objects(
@@ -294,6 +296,12 @@ class Simulation:
         for robot in self.robots:
             if abs(x - robot.x) < 80 and abs(y - robot.y) < 80:
                 return  # Skip - too close to robot
+
+        # Don't spawn on or near the nest
+        nest_buffer = 80  # Buffer around nest
+        if (abs(x - self.nest.x) < self.nest.width / 2 + nest_buffer and
+            abs(y - self.nest.y) < self.nest.height / 2 + nest_buffer):
+            return  # Skip - too close to nest
 
         if self.use_phase2:
             # Phase 2: Spawn a WorldObject

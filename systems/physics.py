@@ -237,7 +237,8 @@ class PhysicsSystem:
                 trash.velocity = (0.0, 0.0)
                 return
 
-        # Check nest collision
+        # Check nest collision - nest is a rigid immovable object
+        # Trash bounces off it, cannot be pushed into it
         nest_rect = pygame.Rect(
             nest.x - nest.width / 2,
             nest.y - nest.height / 2,
@@ -245,6 +246,7 @@ class PhysicsSystem:
             nest.height
         )
         if self._circle_rect_collision(new_x, new_y, trash.size, nest_rect):
+            # Trash hits the rigid nest - stop it
             trash.velocity = (0.0, 0.0)
             return
 
@@ -310,7 +312,7 @@ class PhysicsSystem:
             if self._circle_rect_collision(new_trash_x, new_trash_y, trash.size, obstacle.get_rect()):
                 return False  # Trash blocked by obstacle
 
-        # Check nest collision
+        # Check nest collision - nest is rigid, blocks trash
         nest_rect = pygame.Rect(
             nest.x - nest.width / 2,
             nest.y - nest.height / 2,
@@ -318,7 +320,7 @@ class PhysicsSystem:
             nest.height
         )
         if self._circle_rect_collision(new_trash_x, new_trash_y, trash.size, nest_rect):
-            return False  # Trash blocked by nest
+            return False  # Trash blocked by rigid nest
 
         # Check screen bounds
         if (new_trash_x < SCREEN_MARGIN + trash.size or
