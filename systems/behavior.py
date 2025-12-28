@@ -1362,12 +1362,23 @@ class BehaviorController:
         # Check against each obstacle (inflated to account for robot width)
         for obstacle in self._obstacles:
             rect = obstacle.get_rect()
+
+            # For VISION checks only (account_for_width=False):
+            # Skip this obstacle if the TARGET is ON/NEAR it.
+            # This handles trash sitting on top of obstacles - we can SEE it.
+            # For PATHFINDING (account_for_width=True), we still check all obstacles.
+            if not account_for_width:
+                target_on_obstacle = rect.inflate(20, 20).collidepoint(target_pos)
+                if target_on_obstacle:
+                    continue
+
             # Inflate rect so we check if the robot's BODY would fit, not just center line
             inflated_rect = rect.inflate(inflate_amount, inflate_amount)
             if self._line_intersects_rect(robot_pos, target_pos, inflated_rect):
                 return False
 
         # Also check against nest (inflated for robot width)
+        # ALWAYS check nest for pathfinding - robot must go AROUND it to reach ramp
         nest_rect = self.nest.get_rect()
         inflated_nest = nest_rect.inflate(inflate_amount, inflate_amount)
         if self._line_intersects_rect(robot_pos, target_pos, inflated_nest):
@@ -1443,9 +1454,11 @@ class BehaviorController:
                 self._coordinator.release_claim(self.target_trash.id)
 
         if self._coordinator:
-            # Leave dump queue if abandoning dump process
+            # Only leave dump queue if bin becomes empty (shouldn't happen normally)
+            # Don't leave queue when going to PATROL - robots patrol while waiting their turn
             if old_state in [RobotState.WAITING, RobotState.RETURNING]:
-                if new_state == RobotState.PATROL:
+                if new_state == RobotState.PATROL and not self.robot.bin_full:
+                    # Only leave if bin is somehow empty (edge case)
                     self._coordinator.leave_queue(self.robot.id)
 
             # Release ramp if leaving dock-related states unexpectedly
@@ -1453,13 +1466,29 @@ class BehaviorController:
                 if new_state == RobotState.PATROL:
                     self._coordinator.release_ramp(self.robot.id)
 
-            # Release investigation claim if leaving INVESTIGATING unexpectedly
+            # Release investigation claim if leaving INVESTIGATING for anything except SEEKING
+            # (SEEKING means we're going to pick it up, so keep the claim)
             if old_state == RobotState.INVESTIGATING:
-                if new_state == RobotState.PATROL:
+                if new_state != RobotState.SEEKING:
                     if self._investigation_target:
                         self._coordinator.release_claim(self._investigation_target.id)
                         self._investigation_target = None
                         self._investigation_classification = None
+
+            # Release trash claim if leaving SEEKING without picking up
+            # (APPROACHING/PICKING mean we're still going for it)
+            if old_state == RobotState.SEEKING:
+                if new_state not in [RobotState.APPROACHING, RobotState.PICKING]:
+                    if self.target_trash:
+                        self._coordinator.release_claim(self.target_trash.id)
+                        self.target_trash = None
+
+            # Release trash claim if leaving APPROACHING without picking up
+            if old_state == RobotState.APPROACHING:
+                if new_state != RobotState.PICKING:
+                    if self.target_trash:
+                        self._coordinator.release_claim(self.target_trash.id)
+                        self.target_trash = None
 
         # State entry actions
         if new_state == RobotState.PATROL:
@@ -1534,6 +1563,18 @@ class BehaviorController:
         3. At each waypoint, robot does a 360° scan to check all directions
         4. Any object detected in FOV triggers investigation/pickup
         """
+        # ==============================================
+        # CHECK IF IT'S OUR TURN TO DUMP (when bin is full)
+        # ==============================================
+        # Robots patrol while in dump queue - when it's their turn, go dump
+        if self.robot.bin_full and self._coordinator:
+            queue_pos = self._coordinator.get_queue_position(self.robot.id)
+            if queue_pos >= 0:  # We're in the queue
+                if self._coordinator.can_dump(self.robot.id) and self._coordinator.is_ramp_clear():
+                    # It's our turn! Go dump now
+                    self.transition_to(RobotState.RETURNING)
+                    return
+
         # ==============================================
         # 360° BODY ROTATION SCANNING
         # ==============================================
@@ -2042,12 +2083,17 @@ class BehaviorController:
         self.transition_to(RobotState.PATROL)
 
     def _request_dump_or_wait(self):
-        """Request to dump - queue if needed."""
+        """Request to dump - join queue and keep patrolling until it's our turn."""
         if self._coordinator:
-            if self._coordinator.request_dump(self.robot.id):
+            # Request to join dump queue
+            self._coordinator.request_dump(self.robot.id)
+            # Check if we can go immediately
+            if self._coordinator.can_dump(self.robot.id) and self._coordinator.is_ramp_clear():
                 self.transition_to(RobotState.RETURNING)
             else:
-                self.transition_to(RobotState.WAITING)
+                # Not our turn yet - keep patrolling instead of blocking as a "waiting" rock
+                # The patrol logic will check when it's our turn
+                self.transition_to(RobotState.PATROL)
         else:
             self.transition_to(RobotState.RETURNING)
 
@@ -2056,7 +2102,7 @@ class BehaviorController:
         ramp_entry = self.nest.get_ramp_entry()
         dist_to_ramp = distance(self.robot.position, ramp_entry)
 
-        # When close to the ramp area, check if we can proceed or need to wait
+        # When close to the ramp area, check if we can proceed
         if dist_to_ramp < 80:
             can_proceed = True
             if self._coordinator:
@@ -2072,8 +2118,9 @@ class BehaviorController:
                 self._navigation_waypoint = None  # Clear smart nav waypoint too
                 self.transition_to(RobotState.DOCKING)
             else:
-                # Ramp busy or not our turn - go to waiting area
-                self.transition_to(RobotState.WAITING)
+                # Ramp busy or not our turn - go back to patrol instead of blocking
+                # We stay in queue and patrol will check when it's our turn
+                self.transition_to(RobotState.PATROL)
             return
 
         # Use SMART NAVIGATION to get to the nest
@@ -2159,11 +2206,17 @@ class BehaviorController:
 
         for obstacle in self._obstacles:
             rect = obstacle.get_rect()
+
+            # For VISION checks only: skip if target is ON this obstacle
+            if not account_for_width:
+                if rect.inflate(20, 20).collidepoint(target):
+                    continue
+
             inflated_rect = rect.inflate(inflate_amount, inflate_amount) if inflate_amount > 0 else rect
             if self._line_intersects_rect(start, target, inflated_rect):
                 return False
 
-        # Check nest
+        # ALWAYS check nest - robot must go AROUND it
         nest_rect = self.nest.get_rect()
         inflated_nest = nest_rect.inflate(inflate_amount, inflate_amount) if inflate_amount > 0 else nest_rect
         if self._line_intersects_rect(start, target, inflated_nest):
